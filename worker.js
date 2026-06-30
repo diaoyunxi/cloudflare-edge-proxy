@@ -4,21 +4,24 @@
  * 通过 Cloudflare 边缘节点实现反向代理，
  * 可在 iframe 中嵌入被 X-Frame-Options / CSP 限制的网站。
  *
- * 重要说明：
- *   GitHub、Google 等网站会主动拒绝 Cloudflare Worker IP 的 TLS 连接（525 错误）。
- *   如需代理此类网站，请配置 RELAY_URL 环境变量指向一台中继服务器。
- *
  * 部署方法：
  *   1. 登录 Cloudflare Dashboard → Workers & Pages
  *   2. 创建新 Worker
  *   3. 粘贴此代码 → 保存并部署
- *   4. (可选) 在 Settings → Variables 中配置 RELAY_URL
+ *   4. 在 Settings → Variables 中配置环境变量
  *   或使用 Wrangler: npx wrangler deploy
  *
  * 环境变量：
- *   RELAY_URL - 中继服务器地址（如 https://your-vps.com/fetch?url=）
- *               当直接请求失败时，通过此服务器中继获取内容
+ *   RELAY_URL        - 中继服务器地址（可选，当直连失败时回退使用）
+ *   CF_API_TOKEN     - Cloudflare API 令牌（用于自动更新）
+ *   CF_ACCOUNT_ID    - Cloudflare 账户 ID（用于自动更新）
+ *   CF_SCRIPT_NAME   - Worker 脚本名称（用于自动更新）
  */
+
+// ==================== 版本与配置 ====================
+
+const CURRENT_VERSION = 'v1.5.0';
+const GITHUB_REPO = 'diaoyunxi/cloudflare-edge-proxy';
 
 // ==================== 主页面 ====================
 
@@ -59,7 +62,7 @@ iframe{width:100%;height:100%;border:none}
 <div class="bar">
   <div class="brand">
     <span class="brand-name">Edge<span>Proxy</span></span>
-    <span class="brand-ver">v1.3.2</span>
+    <span class="brand-ver">${CURRENT_VERSION}</span>
     <a class="brand-star" href="https://github.com/diaoyunxi/cloudflare-edge-proxy" target="_blank" title="GitHub 项目地址">
       <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M8 .25a8 8 0 00-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.23.48-2.7-1.07-2.7-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.22.83 1.22.83.72 1.22 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.65-.89-3.65-3.96 0-.87.31-1.59.83-2.15-.08-.2-.36-1.02.08-2.13 0 0 .67-.22 2.2.82a7.6 7.6 0 014 0c1.53-1.04 2.2-.82 2.2-.82.44 1.11.16 1.93.08 2.13.52.56.82 1.28.82 2.15 0 3.08-1.87 3.76-3.66 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 008 .25z"/></svg>
       喜欢就给个 star 吧！
@@ -714,15 +717,174 @@ async function proxyRequest(targetUrl, request, env) {
   return buildErrorResponse(targetUrl, errorCode, errorMsg, !!relayUrl);
 }
 
+// ==================== 自动更新 ====================
+
+/**
+ * 比较版本号（如 v1.5.0 vs v1.6.0）
+ * 返回: 1 表示 a 更新, -1 表示 b 更新, 0 表示相同
+ */
+function compareVersions(a, b) {
+  const pa = a.replace(/^v/, '').split('.').map(Number);
+  const pb = b.replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const va = pa[i] || 0;
+    const vb = pb[i] || 0;
+    if (va > vb) return 1;
+    if (va < vb) return -1;
+  }
+  return 0;
+}
+
+/**
+ * 检查并执行自动更新（每天最多一次）
+ * 通过 Cache API 缓存检查时间，避免频繁请求 GitHub API
+ */
+async function checkForUpdate(env) {
+  // 检查是否配置了必要的环境变量
+  if (!env?.CF_API_TOKEN || !env?.CF_ACCOUNT_ID || !env?.CF_SCRIPT_NAME) {
+    return;
+  }
+
+  const cache = caches.default;
+  const cacheKey = new Request('https://edge-proxy.internal/update-check');
+
+  // 检查今天是否已检查过
+  try {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const data = await cached.json();
+      if (data.lastCheck) {
+        const lastTime = new Date(data.lastCheck).getTime();
+        const now = Date.now();
+        if (now - lastTime < 24 * 60 * 60 * 1000) {
+          return; // 24 小时内已检查过
+        }
+      }
+    }
+  } catch {
+    // 缓存读取失败，继续检查
+  }
+
+  // 查询 GitHub API 获取最新 Release
+  let release;
+  try {
+    const resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, {
+      headers: { 'User-Agent': 'EdgeProxy-SelfUpdate' },
+    });
+    if (!resp.ok) return;
+    release = await resp.json();
+  } catch {
+    return;
+  }
+
+  const latestVersion = release.tag_name;
+  if (!latestVersion) return;
+
+  // 比较版本号
+  if (compareVersions(latestVersion, CURRENT_VERSION) <= 0) {
+    // 当前已是最新版本，更新缓存
+    await cache.put(cacheKey, new Response(JSON.stringify({
+      lastCheck: new Date().toISOString(),
+      latestVersion: latestVersion,
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'max-age=86400',
+      },
+    }));
+    return;
+  }
+
+  // 发现新版本，下载 worker.js
+  // 优先从 release assets 下载
+  let code = null;
+  const asset = release.assets && release.assets.find(a => a.name === 'worker.js');
+  if (asset && asset.browser_download_url) {
+    try {
+      const codeResp = await fetch(asset.browser_download_url, {
+        headers: { 'User-Agent': 'EdgeProxy-SelfUpdate' },
+        redirect: 'follow',
+      });
+      if (codeResp.ok) {
+        code = await codeResp.text();
+      }
+    } catch {
+      // GitHub 下载可能被封锁，尝试备用方案
+    }
+  }
+
+  // 如果从 assets 下载失败，尝试从 raw.githubusercontent.com 下载
+  if (!code) {
+    try {
+      const codeResp = await fetch(
+        `https://raw.githubusercontent.com/${GITHUB_REPO}/main/worker.js`,
+        { headers: { 'User-Agent': 'EdgeProxy-SelfUpdate' } }
+      );
+      if (codeResp.ok) {
+        code = await codeResp.text();
+      }
+    } catch {
+      return;
+    }
+  }
+
+  if (!code) return;
+
+  // 上传新代码到 Cloudflare Workers
+  const metadata = {
+    main_module: 'worker.js',
+    compatibility_date: '2024-01-01',
+    bindings: [
+      { name: 'CF_API_TOKEN', type: 'inherit' },
+      { name: 'CF_ACCOUNT_ID', type: 'inherit' },
+      { name: 'CF_SCRIPT_NAME', type: 'inherit' },
+      { name: 'RELAY_URL', type: 'inherit' },
+    ],
+  };
+
+  try {
+    const formData = new FormData();
+    formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }), 'metadata.json');
+    formData.append('worker.js', new Blob([code], { type: 'application/javascript+module' }), 'worker.js');
+
+    const uploadResp = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${env.CF_SCRIPT_NAME}`,
+      {
+        method: 'PUT',
+        headers: { 'Authorization': `Bearer ${env.CF_API_TOKEN}` },
+        body: formData,
+      }
+    );
+
+    if (uploadResp.ok) {
+      // 更新成功，刷新缓存
+      await cache.put(cacheKey, new Response(JSON.stringify({
+        lastCheck: new Date().toISOString(),
+        latestVersion: latestVersion,
+        updated: true,
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'max-age=86400',
+        },
+      }));
+    }
+  } catch {
+    // 上传失败，静默处理
+  }
+}
+
 // ==================== 主入口 ====================
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
     // 首页
     if (pathname === '/' || pathname === '') {
+      // 异步检查更新（不阻塞首页响应）
+      ctx.waitUntil(checkForUpdate(env));
       return new Response(MAIN_PAGE, {
         headers: {
           'Content-Type': 'text/html; charset=utf-8',
@@ -745,10 +907,22 @@ export default {
 
     // 健康检查
     if (pathname === '/health') {
-      const relay = env?.RELAY_URL || 'not configured';
+      // 检查更新缓存状态
+      let updateInfo = { current: CURRENT_VERSION };
+      try {
+        const cached = await caches.default.match(new Request('https://edge-proxy.internal/update-check'));
+        if (cached) {
+          const data = await cached.json();
+          updateInfo.lastCheck = data.lastCheck;
+          updateInfo.latest = data.latestVersion;
+          updateInfo.updated = data.updated || false;
+        }
+      } catch {}
+
       return new Response(JSON.stringify({
         status: 'OK',
-        relay: relay,
+        version: CURRENT_VERSION,
+        update: updateInfo,
         timestamp: new Date().toISOString(),
       }), {
         status: 200,
