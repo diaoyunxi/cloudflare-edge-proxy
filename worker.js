@@ -127,6 +127,8 @@ function rewriteHtml(html, baseUrl) {
     /((?:src|href|action|poster)\s*=\s*["'])([^"']*)(["'])/gi,
     (match, prefix, url, suffix) => {
       if (!url || /^(data:|javascript:|blob:|#|mailto:|tel:)/i.test(url)) return match;
+      // 跳过已经是本代理路径的 URL，避免嵌套编码
+      if (url.startsWith('/proxy/') || url.startsWith('//proxy/')) return match;
       const resolved = resolveUrl(baseUrl, url);
       if (resolved) return prefix + '/proxy/' + encodeUrl(resolved) + suffix;
       return match;
@@ -161,6 +163,7 @@ function rewriteHtml(html, baseUrl) {
     /url\(["']?([^"')]+)["']?\)/gi,
     (match, url) => {
       if (!url || /^(data:|blob:)/i.test(url)) return match;
+      if (url.startsWith('/proxy/') || url.startsWith('//proxy/')) return match;
       const resolved = resolveUrl(baseUrl, url);
       if (resolved) return 'url(/proxy/' + encodeUrl(resolved) + ')';
       return match;
@@ -185,6 +188,7 @@ function rewriteCss(css, baseUrl) {
     /url\(["']?([^"')]+)["']?\)/gi,
     (match, url) => {
       if (!url || /^(data:|blob:)/i.test(url)) return match;
+      if (url.startsWith('/proxy/') || url.startsWith('//proxy/')) return match;
       const resolved = resolveUrl(baseUrl, url);
       if (resolved) return 'url(/proxy/' + encodeUrl(resolved) + ')';
       return match;
@@ -200,14 +204,21 @@ function getInjectedScript(baseUrl) {
   var PROXY = '/proxy/';
 
   function enc(u){return btoa(u).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
+  function dec(u){var s=u.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';try{return atob(s);}catch(e){return null;}}
   function resolve(u){
     try{return new URL(u,BASE_URL).href;}catch(e){return null;}
   }
   function proxy(u){
+    if(!u)return u;
+    // 已经是本代理路径，不再二次编码
+    if(u.indexOf('/proxy/')===0||u.indexOf('//proxy/')===0)return u;
+    // 已经是绝对 URL 且包含本代理域名
+    if(u.indexOf(location.origin+'/proxy/')===0)return u;
     var r=resolve(u);
     return r?PROXY+enc(r):u;
   }
 
+  // ---- 拦截 fetch ----
   var origFetch=window.fetch;
   window.fetch=function(input,init){
     try{
@@ -220,18 +231,21 @@ function getInjectedScript(baseUrl) {
     return origFetch.call(this,input,init);
   };
 
+  // ---- 拦截 XMLHttpRequest ----
   var origOpen=XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open=function(method,url){
     try{arguments[1]=proxy(url);}catch(e){}
     return origOpen.apply(this,arguments);
   };
 
+  // ---- 拦截 window.open ----
   var origOpen2=window.open;
   window.open=function(){
     try{if(arguments[0]){arguments[0]=proxy(arguments[0]);}}catch(e){}
     return origOpen2.apply(this,arguments);
   };
 
+  // ---- 拦截 history.pushState / replaceState ----
   var origPush=history.pushState;
   history.pushState=function(state,title,url){
     if(url){try{arguments[2]=proxy(url);}catch(e){}}
@@ -243,6 +257,44 @@ function getInjectedScript(baseUrl) {
     return origReplace.apply(this,arguments);
   };
 
+  // ---- 拦截 location 赋值（OAuth 登录重定向关键） ----
+  // 当 Google JS 执行 window.location.href = 'https://accounts.google.com/...'
+  // 时，需要将其转换为代理 URL
+  function patchLocation(obj,name){
+    var orig=Object.getOwnPropertyDescriptor(obj,name);
+    if(orig&&orig.set){
+      Object.defineProperty(obj,name,{
+        set:function(v){orig.set.call(this,proxy(v));},
+        get:orig.get,
+        configurable:true
+      });
+    }
+  }
+  // 拦截 location.href / location.assign / location.replace
+  try{
+    var origAssign=window.location.assign;
+    window.location.assign=function(u){return origAssign.call(this,proxy(u));};
+    var origReplace=window.location.replace;
+    window.location.replace=function(u){return origReplace.call(this,proxy(u));};
+  }catch(e){}
+
+  // ---- 拦截表单提交 ----
+  document.addEventListener('submit',function(e){
+    var form=e.target;
+    if(form&&form.tagName==='FORM'&&form.action){
+      try{
+        var action=form.getAttribute('action')||'';
+        if(action&&!/^(#|javascript:)/i.test(action)){
+          var resolved=resolve(action);
+          if(resolved){
+            form.action=PROXY+enc(resolved);
+          }
+        }
+      }catch(err){}
+    }
+  },true);
+
+  // ---- 链接点击处理 ----
   document.addEventListener('click',function(e){
     var link=e.target.closest&&e.target.closest('a[href]');
     if(link){
@@ -253,12 +305,13 @@ function getInjectedScript(baseUrl) {
     }
   },true);
 
+  // ---- MutationObserver: 动态元素 URL 重写 ----
   function rewriteEl(el){
     var attrs=['src','href','action','poster'];
     for(var i=0;i<attrs.length;i++){
       if(el.hasAttribute&&el.hasAttribute(attrs[i])){
         var v=el.getAttribute(attrs[i]);
-        if(v&&!/^(\\/proxy\\/|data:|javascript:|blob:|#|mailto:|tel:)/i.test(v)){
+        if(v&&!/^(\\/proxy\\/|\\/\\/proxy\\/|data:|javascript:|blob:|#|mailto:|tel:)/i.test(v)){
           try{
             var r=resolve(v);
             if(r){el.setAttribute(attrs[i],PROXY+enc(r));}
@@ -271,7 +324,7 @@ function getInjectedScript(baseUrl) {
       var parts=ss.split(',').map(function(p){
         var t=p.trim().split(/\\s+/);
         var u=t[0];
-        if(u&&!/^(data:|blob:)/i.test(u)){
+        if(u&&!/^(data:|blob:)/i.test(u)&&u.indexOf('/proxy/')!==0){
           var r=resolve(u);
           if(r){t[0]=PROXY+enc(r);}
         }
