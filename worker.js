@@ -661,33 +661,7 @@ async function proxyRequest(targetUrl, request, env) {
     if (contentType.includes('text/html')) {
       try {
         const body = await directResponse.text();
-        if (isCaptchaPage(contentType, body)) {
-          // 检测到验证页面，尝试中继
-          if (relayUrl) {
-            try {
-              const relayResponse = await relayFetch(targetUrl, request, relayUrl);
-              if (relayResponse.ok) {
-                const relayBody = await relayResponse.text();
-                const relayCt = relayResponse.headers.get('Content-Type') || '';
-                if (!isCaptchaPage(relayCt, relayBody)) {
-                  // 中继返回的不是验证页面，使用中继结果
-                  const relayHeaders = cleanHeaders(relayResponse.headers);
-                  relayHeaders.set('Content-Type', 'text/html; charset=utf-8');
-                  const rewritten = rewriteHtml(relayBody, targetUrl);
-                  return new Response(rewritten, {
-                    status: relayResponse.status,
-                    headers: relayHeaders,
-                  });
-                }
-              }
-            } catch (e) {
-              // 中继失败
-            }
-          }
-          // 中继也失败或未配置，返回验证页面提示
-          return buildCaptchaResponse(targetUrl, !!relayUrl);
-        }
-        // 不是验证页面，正常处理
+        // 即使是验证页面，也直接返回给用户，让用户自己完成验证
         const newHeaders = cleanHeaders(directResponse.headers);
         newHeaders.set('Content-Type', 'text/html; charset=utf-8');
         const rewritten = rewriteHtml(body, finalUrl);
