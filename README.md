@@ -1,6 +1,6 @@
 # Edge Proxy — Cloudflare Worker 边缘代理
 
-通过 Cloudflare 边缘节点实现反向代理，可在 iframe 中嵌入被 `X-Frame-Options` / `Content-Security-Policy` 限制的网站（如 GitHub、Google 等）。
+通过 Cloudflare 边缘节点实现反向代理，可在 iframe 中嵌入被 `X-Frame-Options` / `Content-Security-Policy` 限制的网站。
 
 ## 功能特性
 
@@ -11,6 +11,15 @@
 - **动态请求拦截** — 注入脚本拦截 `fetch`、`XMLHttpRequest`、`window.open`、`history.pushState` 等
 - **MutationObserver** — 监听动态添加的 DOM 元素并重写其 URL
 - **多内容类型支持** — HTML、CSS、JavaScript、JSON、图片、视频、字体等
+- **中继服务器支持** — 当目标网站封锁 Cloudflare IP 时，自动回退到中继服务器
+
+## 重要：GitHub/Google 525 错误说明
+
+GitHub、Google 等网站会**主动拒绝 Cloudflare Worker IP 的 TLS 连接**，导致 `525 SSL Handshake Failed` 错误。这不是代码问题，而是这些网站在网络层面封锁了 Cloudflare 的 IP 段。
+
+**解决方案**：部署一台 VPS 作为中继服务器，配置 `RELAY_URL` 环境变量。Worker 在直连失败时会自动回退到中继服务器获取内容。
+
+详见下方[中继服务器部署](#中继服务器部署可选)章节。
 
 ## 快速部署
 
@@ -25,17 +34,11 @@
 ### 方式二：Wrangler CLI
 
 ```bash
-# 安装 Wrangler
 npm install -g wrangler
-
-# 登录
 wrangler login
 
-# 克隆仓库
-git clone https://github.com/你的用户名/cloudflare-edge-proxy.git
+git clone https://github.com/diaoyunxi/cloudflare-edge-proxy.git
 cd cloudflare-edge-proxy
-
-# 部署
 wrangler deploy
 ```
 
@@ -52,48 +55,85 @@ wrangler deploy
 https://your-worker.workers.dev/?url=github.com
 ```
 
+## 中继服务器部署（可选）
+
+当需要代理 GitHub、Google 等封锁 Cloudflare IP 的网站时，需要部署中继服务器。
+
+### 步骤一：部署中继服务器
+
+在一台 VPS 上运行 `relay-server.js`：
+
+```bash
+# 在 VPS 上
+git clone https://github.com/diaoyunxi/cloudflare-edge-proxy.git
+cd cloudflare-edge-proxy
+
+# 直接运行（需要 Node.js）
+node relay-server.js
+
+# 或使用 PM2 守护进程
+npm install -g pm2
+pm2 start relay-server.js --name relay
+```
+
+中继服务器默认运行在 `3000` 端口，可通过 `PORT` 环境变量修改。
+
+### 步骤二：配置 Worker 环境变量
+
+在 Cloudflare Dashboard 中：
+
+1. 进入 Workers & Pages → 选择你的 Worker
+2. Settings → Variables
+3. 添加环境变量：
+   - 变量名：`RELAY_URL`
+   - 变量值：`http://your-vps-ip:3000/fetch?url=`
+4. 保存并重新部署
+
+### 步骤三：验证
+
+访问 `https://your-worker.workers.dev/health`，确认 `relay` 字段已显示你的中继服务器地址。
+
 ## 工作原理
 
 ```
 用户浏览器 → Cloudflare 边缘节点 (Worker) → 目标网站
-                ↑
-         移除 X-Frame-Options / CSP
-         重写 HTML/CSS 中的 URL
-         注入客户端脚本拦截动态请求
+                    ↓ (如果 525/被封锁)
+                中继服务器 (VPS) → 目标网站
 ```
 
-1. 用户在地址栏输入 URL
-2. Worker 将 URL 进行 Base64 编码，作为路径参数（`/proxy/<encoded>`）
-3. iframe 加载该代理 URL
-4. Worker 在边缘节点获取目标网站内容
-5. 移除阻止嵌入的响应头（X-Frame-Options、CSP 等）
-6. 重写 HTML/CSS 中的所有 URL，使资源请求也经过代理
-7. 注入客户端脚本，拦截 `fetch`/`XHR`/`window.open`/`history` 等动态请求
+1. Worker 首先尝试直接获取目标网站
+2. 如果返回 525/521/522 等 Cloudflare 边缘错误，自动回退到中继服务器
+3. 中继服务器（部署在普通 VPS 上，IP 不被封锁）获取内容并返回给 Worker
+4. Worker 对内容进行 URL 重写、头部清理、脚本注入后返回给用户
 
 ## 已知限制
 
 - **登录/会话** — 不转发 Cookie，需要登录的网站可能无法正常使用
 - **WebSocket** — 暂不支持 WebSocket 代理
-- **Service Worker** — 目标网站的 Service Worker 注册会被忽略
-- **`window.location`** — 页面内 JavaScript 读取的 `location` 为代理 URL，非原始 URL
+- **GitHub/Google 直连** — 这些网站封锁 Cloudflare Worker IP，需配置中继服务器
 - **部分 SPA** — 高度依赖 `window.location` 的单页应用可能出现导航异常
-- **CORS 预检** — 复杂的 CORS 预检请求可能不被正确处理
 
 ## 文件结构
 
 ```
 cloudflare-edge-proxy/
-├── worker.js        # Worker 主脚本（可直接粘贴到 Dashboard 使用）
-├── wrangler.toml    # Wrangler 配置文件
-├── package.json     # npm 包配置
-└── README.md        # 说明文档
+├── worker.js          # Worker 主脚本（可直接粘贴到 Dashboard）
+├── relay-server.js    # 中继服务器脚本（部署在 VPS 上）
+├── wrangler.toml      # Wrangler 配置文件
+├── package.json       # npm 包配置
+└── README.md          # 说明文档
 ```
+
+## 环境变量
+
+| 变量名 | 说明 | 示例 |
+|--------|------|------|
+| `RELAY_URL` | 中继服务器地址（直连失败时回退使用） | `http://your-vps:3000/fetch?url=` |
 
 ## 技术栈
 
-- **运行时**：Cloudflare Workers（V8 引擎）
-- **语言**：原生 JavaScript（ES Modules）
-- **无依赖** — 不需要任何 npm 包
+- **Worker 运行时**：Cloudflare Workers（V8 引擎，ES Modules，无依赖）
+- **中继服务器**：Node.js（无第三方依赖）
 
 ## License
 

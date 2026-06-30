@@ -2,13 +2,22 @@
  * Cloudflare Worker — Edge Proxy
  *
  * 通过 Cloudflare 边缘节点实现反向代理，
- * 可在 iframe 中嵌入被 X-Frame-Options / CSP 限制的网站（如 GitHub）。
+ * 可在 iframe 中嵌入被 X-Frame-Options / CSP 限制的网站。
+ *
+ * 重要说明：
+ *   GitHub、Google 等网站会主动拒绝 Cloudflare Worker IP 的 TLS 连接（525 错误）。
+ *   如需代理此类网站，请配置 RELAY_URL 环境变量指向一台中继服务器。
  *
  * 部署方法：
  *   1. 登录 Cloudflare Dashboard → Workers & Pages
  *   2. 创建新 Worker
  *   3. 粘贴此代码 → 保存并部署
+ *   4. (可选) 在 Settings → Variables 中配置 RELAY_URL
  *   或使用 Wrangler: npx wrangler deploy
+ *
+ * 环境变量：
+ *   RELAY_URL - 中继服务器地址（如 https://your-vps.com/fetch?url=）
+ *               当直接请求失败时，通过此服务器中继获取内容
  */
 
 // ==================== 主页面 ====================
@@ -92,34 +101,28 @@ function resolveUrl(base, relative) {
   }
 }
 
+/** 检测是否为 Cloudflare 5xx 边缘错误（525 SSL握手失败等） */
+function isCloudflareEdgeError(status) {
+  return status >= 520 && status <= 526;
+}
+
 // ==================== 内容重写 ====================
 
 /**
  * 重写 HTML 中的所有 URL，使其通过代理
- * @param {string} html - 原始 HTML
- * @param {string} baseUrl - 基础 URL（用于解析相对路径）
- * @returns {string} 重写后的 HTML
  */
 function rewriteHtml(html, baseUrl) {
-  // 移除已有的 <base> 标签（我们自行处理 URL）
   html = html.replace(/<base\s[^>]*>/gi, '');
-
-  // 更新 <meta charset> 为 UTF-8（因为我们以 UTF-8 返回）
   html = html.replace(/<meta\s+charset=["']?[^"'>\s]*/gi, '<meta charset="UTF-8"');
   html = html.replace(
     /(<meta\s+http-equiv=["']Content-Type["']\s+content=["']text\/html;\s*charset=)[^"']*/gi,
     '$1UTF-8'
   );
-
-  // 移除 preconnect / dns-prefetch 链接（直接连接原始域名无意义）
   html = html.replace(/<link\s+[^>]*rel=["'](preconnect|dns-prefetch)["'][^>]*>/gi, '');
-
-  // 移除 integrity 和 crossorigin 属性（代理后内容可能被修改，校验会失败）
   html = html.replace(/\s+integrity\s*=\s*["'][^"']*["']/gi, '');
   html = html.replace(/\s+crossorigin\s*=\s*["'][^"']*["']/gi, '');
   html = html.replace(/\s+crossorigin(?=[\s>])/gi, '');
 
-  // 重写 src / href / action / poster 属性中的 URL
   html = html.replace(
     /((?:src|href|action|poster)\s*=\s*["'])([^"']*)(["'])/gi,
     (match, prefix, url, suffix) => {
@@ -130,7 +133,6 @@ function rewriteHtml(html, baseUrl) {
     }
   );
 
-  // 重写 srcset 属性
   html = html.replace(
     /(srcset\s*=\s*["'])([^"']*)(["'])/gi,
     (match, prefix, srcset, suffix) => {
@@ -146,7 +148,6 @@ function rewriteHtml(html, baseUrl) {
     }
   );
 
-  // 重写 meta refresh 跳转
   html = html.replace(
     /(<meta\s+http-equiv=["']refresh["']\s+content=["'][^;]*;\s*url=)([^"']*)(["'])/gi,
     (match, prefix, url, suffix) => {
@@ -156,7 +157,6 @@ function rewriteHtml(html, baseUrl) {
     }
   );
 
-  // 重写 CSS url() 引用（包括 <style> 标签和 inline style）
   html = html.replace(
     /url\(["']?([^"')]+)["']?\)/gi,
     (match, url) => {
@@ -167,7 +167,6 @@ function rewriteHtml(html, baseUrl) {
     }
   );
 
-  // 注入客户端脚本，处理动态请求
   const injectScript = getInjectedScript(baseUrl);
   if (html.includes('</body>')) {
     html = html.replace('</body>', injectScript + '\n</body>');
@@ -180,9 +179,7 @@ function rewriteHtml(html, baseUrl) {
   return html;
 }
 
-/**
- * 重写 CSS 中的 url() 引用
- */
+/** 重写 CSS 中的 url() 引用 */
 function rewriteCss(css, baseUrl) {
   return css.replace(
     /url\(["']?([^"')]+)["']?\)/gi,
@@ -195,10 +192,7 @@ function rewriteCss(css, baseUrl) {
   );
 }
 
-/**
- * 生成注入到代理页面的客户端脚本
- * 拦截 fetch / XHR / window.open / 链接点击 / history 等
- */
+/** 生成注入到代理页面的客户端脚本 */
 function getInjectedScript(baseUrl) {
   return `<script>
 (function(){
@@ -214,7 +208,6 @@ function getInjectedScript(baseUrl) {
     return r?PROXY+enc(r):u;
   }
 
-  // ---- 拦截 fetch ----
   var origFetch=window.fetch;
   window.fetch=function(input,init){
     try{
@@ -227,21 +220,18 @@ function getInjectedScript(baseUrl) {
     return origFetch.call(this,input,init);
   };
 
-  // ---- 拦截 XMLHttpRequest ----
   var origOpen=XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open=function(method,url){
     try{arguments[1]=proxy(url);}catch(e){}
     return origOpen.apply(this,arguments);
   };
 
-  // ---- 拦截 window.open ----
   var origOpen2=window.open;
   window.open=function(){
     try{if(arguments[0]){arguments[0]=proxy(arguments[0]);}}catch(e){}
     return origOpen2.apply(this,arguments);
   };
 
-  // ---- 拦截 history.pushState / replaceState ----
   var origPush=history.pushState;
   history.pushState=function(state,title,url){
     if(url){try{arguments[2]=proxy(url);}catch(e){}}
@@ -253,7 +243,6 @@ function getInjectedScript(baseUrl) {
     return origReplace.apply(this,arguments);
   };
 
-  // ---- 链接点击处理 ----
   document.addEventListener('click',function(e){
     var link=e.target.closest&&e.target.closest('a[href]');
     if(link){
@@ -264,7 +253,6 @@ function getInjectedScript(baseUrl) {
     }
   },true);
 
-  // ---- MutationObserver: 动态元素 URL 重写 ----
   function rewriteEl(el){
     var attrs=['src','href','action','poster'];
     for(var i=0;i<attrs.length;i++){
@@ -278,7 +266,6 @@ function getInjectedScript(baseUrl) {
         }
       }
     }
-    // 处理 srcset
     if(el.hasAttribute&&el.hasAttribute('srcset')){
       var ss=el.getAttribute('srcset');
       var parts=ss.split(',').map(function(p){
@@ -316,163 +303,267 @@ function getInjectedScript(baseUrl) {
 
 // ==================== 响应头处理 ====================
 
-/**
- * 清理响应头，移除阻止嵌入的头部
- */
 function cleanHeaders(headers) {
   const h = new Headers(headers);
-
-  // 移除阻止 iframe 嵌入的头
   h.delete('X-Frame-Options');
   h.delete('Content-Security-Policy');
   h.delete('Content-Security-Policy-Report-Only');
   h.delete('Content-Security');
-
-  // 移除可能引起问题的头
   h.delete('Transfer-Encoding');
   h.delete('Content-Encoding');
   h.delete('Content-Length');
-
-  // 移除 cookie（避免在代理域上设置）
   h.delete('Set-Cookie');
   h.delete('Set-Cookie2');
-
-  // 移除预连接/预加载链接
   h.delete('Link');
-
-  // 移除 HSTS（避免影响代理域）
   h.delete('Strict-Transport-Security');
-
   return h;
+}
+
+// ==================== 响应处理 ====================
+
+/**
+ * 处理 fetch 返回的响应：重写 URL、清理头部、注入脚本
+ */
+async function processResponse(response, finalUrl) {
+  const contentType = response.headers.get('Content-Type') || '';
+  const newHeaders = cleanHeaders(response.headers);
+
+  // ---- HTML ----
+  if (contentType.includes('text/html')) {
+    let html = await response.text();
+    html = rewriteHtml(html, finalUrl);
+    newHeaders.set('Content-Type', 'text/html; charset=utf-8');
+    return new Response(html, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders,
+    });
+  }
+
+  // ---- CSS ----
+  if (contentType.includes('text/css')) {
+    let css = await response.text();
+    css = rewriteCss(css, finalUrl);
+    newHeaders.set('Content-Type', 'text/css; charset=utf-8');
+    return new Response(css, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders,
+    });
+  }
+
+  // ---- JavaScript ----
+  if (contentType.includes('javascript')) {
+    const js = await response.text();
+    newHeaders.set('Content-Type', 'application/javascript; charset=utf-8');
+    return new Response(js, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders,
+    });
+  }
+
+  // ---- JSON ----
+  if (contentType.includes('json')) {
+    const json = await response.text();
+    newHeaders.set('Content-Type', 'application/json; charset=utf-8');
+    return new Response(json, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders,
+    });
+  }
+
+  // ---- 其他内容：直接透传 ----
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  });
+}
+
+// ==================== 错误页面 ====================
+
+/**
+ * 生成友好的错误页面
+ */
+function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
+  const isEdgeError = isCloudflareEdgeError(statusCode);
+
+  let title = '代理请求失败';
+  let desc = '';
+  let suggestion = '';
+
+  if (isEdgeError) {
+    const errorMap = {
+      521: '目标服务器拒绝连接',
+      522: '连接超时',
+      523: '无法到达目标服务器',
+      524: '请求超时',
+      525: 'SSL 握手失败 — 目标网站拒绝了来自 Cloudflare 的 TLS 连接',
+      526: 'SSL 证书无效',
+    };
+    title = '无法连接到目标网站';
+    desc = errorMap[statusCode] || 'Cloudflare 边缘错误';
+    suggestion = hasRelay
+      ? '中继服务器也无法访问该网站。该网站可能封锁了所有云服务 IP。'
+      : '该网站（如 GitHub、Google）主动封锁了 Cloudflare Worker 的 IP 地址。<br>请在 Worker 设置中配置 <code>RELAY_URL</code> 环境变量，指向一台中继服务器以绕过限制。';
+  } else if (statusCode === 0) {
+    title = '连接被拒绝';
+    desc = errorMsg || '无法建立到目标服务器的连接';
+    suggestion = hasRelay
+      ? '中继服务器也无法访问该网站。'
+      : '目标网站可能封锁了 Cloudflare 的 IP，或服务器不可达。<br>建议配置 <code>RELAY_URL</code> 环境变量使用中继服务器。';
+  } else {
+    desc = errorMsg || `HTTP ${statusCode}`;
+  }
+
+  return new Response(
+    `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<style>` +
+    `body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#eee;padding:60px 20px;text-align:center}` +
+    `.card{max-width:600px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.3)}` +
+    `h2{color:#e94560;margin-bottom:16px}` +
+    `.target{color:#0f3460;background:#0f0f1a;padding:8px 16px;border-radius:6px;display:inline-block;margin:12px 0;word-break:break-all;font-size:13px;color:#888}` +
+    `.desc{color:#aaa;margin:12px 0;line-height:1.6}` +
+    `.suggestion{color:#666;font-size:13px;margin-top:20px;padding-top:20px;border-top:1px solid #1a1a3e;line-height:1.8}` +
+    `code{background:#0f0f1a;color:#e94560;padding:2px 8px;border-radius:4px;font-size:13px}` +
+    `a{color:#e94560;text-decoration:none}a:hover{text-decoration:underline}` +
+    `.code{font-size:48px;color:#333;margin-bottom:8px}` +
+    `</style></head><body>` +
+    `<div class="card">` +
+    `<div class="code">${statusCode || 'ERR'}</div>` +
+    `<h2>${title}</h2>` +
+    `<div class="target">${targetUrl}</div>` +
+    `<p class="desc">${desc}</p>` +
+    `<div class="suggestion">${suggestion}</div>` +
+    `<p style="margin-top:24px"><a href="/">← 返回首页</a></p>` +
+    `</div></body></html>`,
+    {
+      status: 502,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    }
+  );
 }
 
 // ==================== 代理请求 ====================
 
 /**
- * 代理请求处理
+ * 直接通过 Cloudflare 边缘节点获取目标内容
+ */
+async function directFetch(targetUrl, request) {
+  const target = new URL(targetUrl);
+
+  const reqHeaders = new Headers();
+  const forwardHeaders = ['Accept', 'Accept-Language', 'Content-Type', 'Content-Disposition'];
+  for (const name of forwardHeaders) {
+    const val = request.headers.get(name);
+    if (val) reqHeaders.set(name, val);
+  }
+  reqHeaders.set('User-Agent',
+    request.headers.get('User-Agent') ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  );
+  reqHeaders.set('Referer', target.origin + '/');
+
+  return await fetch(targetUrl, {
+    method: request.method,
+    headers: reqHeaders,
+    body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
+    redirect: 'follow',
+  });
+}
+
+/**
+ * 通过中继服务器获取目标内容
+ * 中继服务器需要支持: GET https://your-relay/fetch?url=<encoded_url>
+ * 返回原始响应体和 Content-Type 头
+ */
+async function relayFetch(targetUrl, request, relayUrl) {
+  const relayTarget = relayUrl + encodeURIComponent(targetUrl);
+
+  const response = await fetch(relayTarget, {
+    method: 'GET',
+    headers: {
+      'Accept': '*/*',
+      'X-Original-URL': targetUrl,
+    },
+    redirect: 'follow',
+  });
+
+  return response;
+}
+
+/**
+ * 代理请求主处理函数
  * @param {string} targetUrl - 目标 URL
  * @param {Request} request - 原始请求
+ * @param {Object} env - 环境变量
  * @returns {Promise<Response>}
  */
-async function proxyRequest(targetUrl, request) {
+async function proxyRequest(targetUrl, request, env) {
+  const relayUrl = env?.RELAY_URL || '';
+
+  // 验证 URL
+  let target;
   try {
-    // 验证 URL
-    let target;
-    try {
-      target = new URL(targetUrl);
-    } catch {
-      return new Response('Invalid URL: ' + targetUrl, { status: 400 });
-    }
-
-    // 只允许 http/https 协议
-    if (!['http:', 'https:'].includes(target.protocol)) {
-      return new Response('Unsupported protocol', { status: 403 });
-    }
-
-    // 构造请求头
-    const reqHeaders = new Headers();
-    const forwardHeaders = [
-      'Accept',
-      'Accept-Language',
-      'Content-Type',
-      'Content-Disposition',
-    ];
-    for (const name of forwardHeaders) {
-      const val = request.headers.get(name);
-      if (val) reqHeaders.set(name, val);
-    }
-    reqHeaders.set('User-Agent',
-      request.headers.get('User-Agent') ||
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-    reqHeaders.set('Referer', target.origin + '/');
-
-    // 发起请求
-    const response = await fetch(targetUrl, {
-      method: request.method,
-      headers: reqHeaders,
-      body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
-      redirect: 'follow',
-    });
-
-    // 使用最终 URL（跟随重定向后）作为基准
-    const finalUrl = response.url || targetUrl;
-    const contentType = response.headers.get('Content-Type') || '';
-    const newHeaders = cleanHeaders(response.headers);
-
-    // ---- HTML ----
-    if (contentType.includes('text/html')) {
-      let html = await response.text();
-      html = rewriteHtml(html, finalUrl);
-      newHeaders.set('Content-Type', 'text/html; charset=utf-8');
-      return new Response(html, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
-      });
-    }
-
-    // ---- CSS ----
-    if (contentType.includes('text/css')) {
-      let css = await response.text();
-      css = rewriteCss(css, finalUrl);
-      newHeaders.set('Content-Type', 'text/css; charset=utf-8');
-      return new Response(css, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
-      });
-    }
-
-    // ---- JavaScript ----
-    if (contentType.includes('javascript')) {
-      const js = await response.text();
-      newHeaders.set('Content-Type', 'application/javascript; charset=utf-8');
-      return new Response(js, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
-      });
-    }
-
-    // ---- JSON ----
-    if (contentType.includes('json')) {
-      const json = await response.text();
-      newHeaders.set('Content-Type', 'application/json; charset=utf-8');
-      return new Response(json, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
-      });
-    }
-
-    // ---- 其他内容（图片/视频/字体等）：直接透传 ----
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: newHeaders,
-    });
-
-  } catch (error) {
-    return new Response(
-      `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>` +
-      `<body style="font-family:sans-serif;padding:40px;text-align:center">` +
-      `<h2 style="color:#e94560">代理请求失败</h2>` +
-      `<p>目标: ${targetUrl}</p>` +
-      `<p style="color:#999">${error.message}</p>` +
-      `<a href="/" style="color:#e94560">返回首页</a></body></html>`,
-      {
-        status: 502,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      }
-    );
+    target = new URL(targetUrl);
+  } catch {
+    return new Response('Invalid URL: ' + targetUrl, { status: 400 });
   }
+
+  if (!['http:', 'https:'].includes(target.protocol)) {
+    return new Response('Unsupported protocol', { status: 403 });
+  }
+
+  // ---- 第一步：尝试直接获取 ----
+  let directResponse = null;
+  let directError = null;
+
+  try {
+    directResponse = await directFetch(targetUrl, request);
+  } catch (err) {
+    directError = err;
+  }
+
+  // 如果直接获取成功且不是边缘错误，直接处理返回
+  if (directResponse && !isCloudflareEdgeError(directResponse.status)) {
+    const finalUrl = directResponse.url || targetUrl;
+    try {
+      return await processResponse(directResponse, finalUrl);
+    } catch (err) {
+      return buildErrorResponse(targetUrl, 0, err.message, !!relayUrl);
+    }
+  }
+
+  // ---- 第二步：直接获取失败（525/521/522 等），尝试中继 ----
+  const errorCode = directResponse ? directResponse.status : 0;
+  const errorMsg = directError ? directError.message : '';
+
+  if (relayUrl) {
+    try {
+      const relayResponse = await relayFetch(targetUrl, request, relayUrl);
+
+      if (relayResponse.ok || (relayResponse.status < 520 && relayResponse.status !== 0)) {
+        // 中继成功，处理响应
+        // 构造一个合成响应，使用目标 URL 作为基准
+        const finalUrl = targetUrl;
+        return await processResponse(relayResponse, finalUrl);
+      }
+    } catch (err) {
+      // 中继也失败了
+    }
+  }
+
+  // ---- 所有方法都失败，返回错误页面 ----
+  return buildErrorResponse(targetUrl, errorCode, errorMsg, !!relayUrl);
 }
 
 // ==================== 主入口 ====================
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
@@ -500,7 +591,15 @@ export default {
 
     // 健康检查
     if (pathname === '/health') {
-      return new Response('OK', { status: 200 });
+      const relay = env?.RELAY_URL || 'not configured';
+      return new Response(JSON.stringify({
+        status: 'OK',
+        relay: relay,
+        timestamp: new Date().toISOString(),
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     // 代理请求
@@ -517,7 +616,7 @@ export default {
         return new Response('Invalid URL encoding', { status: 400 });
       }
 
-      // 追加 query string（如果有额外参数）
+      // 追加 query string
       if (url.search) {
         try {
           const targetObj = new URL(targetUrl);
@@ -531,7 +630,7 @@ export default {
         }
       }
 
-      return proxyRequest(targetUrl, request);
+      return proxyRequest(targetUrl, request, env);
     }
 
     // 404
