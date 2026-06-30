@@ -32,9 +32,14 @@ const MAIN_PAGE = `<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f1a;height:100vh;display:flex;flex-direction:column;overflow:hidden}
 .bar{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#1a1a2e;box-shadow:0 2px 12px rgba(0,0,0,.3);z-index:10}
-.brand{color:#e94560;font-weight:700;font-size:18px;white-space:nowrap;letter-spacing:-.5px}
-.brand span{color:#0f3460}
-.search{flex:1;display:flex;background:#16213e;border-radius:8px;overflow:hidden;border:1px solid #1a1a3e;transition:border-color .2s}
+.brand{display:flex;align-items:center;gap:8px;white-space:nowrap}
+.brand-name{color:#e94560;font-weight:700;font-size:18px;letter-spacing:-.5px}
+.brand-name span{color:#0f3460}
+.brand-ver{color:#555;font-size:11px;font-weight:400}
+.brand-star{display:flex;align-items:center;gap:4px;text-decoration:none;color:#888;font-size:12px;transition:color .2s}
+.brand-star:hover{color:#e94560}
+.brand-star svg{width:14px;height:14px;fill:currentColor}
+.search{flex:1;display:flex;background:#16213e;border-radius:8px;overflow:hidden;border:1px solid #1a1a3e;transition:border-color .2s;margin-left:8px}
 .search:focus-within{border-color:#e94560}
 .search input{flex:1;background:none;border:none;outline:none;color:#eee;padding:10px 16px;font-size:14px}
 .search input::placeholder{color:#555}
@@ -52,7 +57,14 @@ iframe{width:100%;height:100%;border:none}
 </head>
 <body>
 <div class="bar">
-  <div class="brand">&#9889;<span>Edge</span>Proxy</div>
+  <div class="brand">
+    <span class="brand-name">Edge<span>Proxy</span></span>
+    <span class="brand-ver">v1.3.2</span>
+    <a class="brand-star" href="https://github.com/diaoyunxi/cloudflare-edge-proxy" target="_blank" title="GitHub 项目地址">
+      <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M8 .25a8 8 0 00-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.23.48-2.7-1.07-2.7-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.22.83 1.22.83.72 1.22 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.65-.89-3.65-3.96 0-.87.31-1.59.83-2.15-.08-.2-.36-1.02.08-2.13 0 0 .67-.22 2.2.82a7.6 7.6 0 014 0c1.53-1.04 2.2-.82 2.2-.82.44 1.11.16 1.93.08 2.13.52.56.82 1.28.82 2.15 0 3.08-1.87 3.76-3.66 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 008 .25z"/></svg>
+      喜欢就给个 star 吧！
+    </a>
+  </div>
   <div class="search">
     <input id="u" placeholder="输入网址，如 github.com" autocomplete="off" spellcheck="false">
     <button id="g">前往</button>
