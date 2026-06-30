@@ -438,37 +438,31 @@ async function processResponse(response, finalUrl) {
 // ==================== 错误页面 ====================
 
 /**
- * 生成友好的错误页面
+ * 生成友好的错误页面（面向普通用户，不显示技术细节）
  */
 function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
   const isEdgeError = isCloudflareEdgeError(statusCode);
 
-  let title = '代理请求失败';
+  let title = '页面加载失败';
   let desc = '';
-  let suggestion = '';
 
   if (isEdgeError) {
-    const errorMap = {
-      521: '目标服务器拒绝连接',
-      522: '连接超时',
-      523: '无法到达目标服务器',
-      524: '请求超时',
-      525: 'SSL 握手失败 — 目标网站拒绝了来自 Cloudflare 的 TLS 连接',
-      526: 'SSL 证书无效',
-    };
-    title = '无法连接到目标网站';
-    desc = errorMap[statusCode] || 'Cloudflare 边缘错误';
-    suggestion = hasRelay
-      ? '中继服务器也无法访问该网站。该网站可能封锁了所有云服务 IP。'
-      : '该网站（如 GitHub、Google）主动封锁了 Cloudflare Worker 的 IP 地址。<br>请在 Worker 设置中配置 <code>RELAY_URL</code> 环境变量，指向一台中继服务器以绕过限制。';
+    title = '暂时无法访问该网站';
+    desc = '目标网站暂时无法连接，可能是网络波动或该网站限制了代理访问。请稍后重试。';
   } else if (statusCode === 0) {
-    title = '连接被拒绝';
-    desc = errorMsg || '无法建立到目标服务器的连接';
-    suggestion = hasRelay
-      ? '中继服务器也无法访问该网站。'
-      : '目标网站可能封锁了 Cloudflare 的 IP，或服务器不可达。<br>建议配置 <code>RELAY_URL</code> 环境变量使用中继服务器。';
+    title = '无法连接到目标网站';
+    desc = '网络连接出现问题，请检查网址是否正确后重试。';
+  } else if (statusCode === 404) {
+    title = '页面不存在';
+    desc = '找不到这个页面，可能已被删除或网址有误。';
+  } else if (statusCode === 403) {
+    title = '访问被拒绝';
+    desc = '该网站拒绝了访问请求。';
+  } else if (statusCode >= 500) {
+    title = '目标网站出错';
+    desc = '目标网站服务器出现了问题，请稍后重试。';
   } else {
-    desc = errorMsg || `HTTP ${statusCode}`;
+    desc = '请求出现问题，请稍后重试。';
   }
 
   return new Response(
@@ -476,22 +470,22 @@ function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<style>` +
     `body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#eee;padding:60px 20px;text-align:center}` +
-    `.card{max-width:600px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.3)}` +
+    `.card{max-width:480px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.3)}` +
     `h2{color:#e94560;margin-bottom:16px}` +
-    `.target{color:#0f3460;background:#0f0f1a;padding:8px 16px;border-radius:6px;display:inline-block;margin:12px 0;word-break:break-all;font-size:13px;color:#888}` +
+    `.target{color:#888;background:#0f0f1a;padding:8px 16px;border-radius:6px;display:inline-block;margin:12px 0;word-break:break-all;font-size:13px}` +
     `.desc{color:#aaa;margin:12px 0;line-height:1.6}` +
-    `.suggestion{color:#666;font-size:13px;margin-top:20px;padding-top:20px;border-top:1px solid #1a1a3e;line-height:1.8}` +
-    `code{background:#0f0f1a;color:#e94560;padding:2px 8px;border-radius:4px;font-size:13px}` +
     `a{color:#e94560;text-decoration:none}a:hover{text-decoration:underline}` +
-    `.code{font-size:48px;color:#333;margin-bottom:8px}` +
+    `.icon{font-size:48px;margin-bottom:8px}` +
+    `.retry{display:inline-block;margin-top:20px;padding:10px 28px;background:#e94560;color:#fff;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:background .2s}` +
+    `.retry:hover{background:#c73e54}` +
     `</style></head><body>` +
     `<div class="card">` +
-    `<div class="code">${statusCode || 'ERR'}</div>` +
+    `<div class="icon">&#128533;</div>` +
     `<h2>${title}</h2>` +
     `<div class="target">${targetUrl}</div>` +
     `<p class="desc">${desc}</p>` +
-    `<div class="suggestion">${suggestion}</div>` +
-    `<p style="margin-top:24px"><a href="/">← 返回首页</a></p>` +
+    `<button class="retry" onclick="location.reload()">&#8635; 重试</button>` +
+    `<p style="margin-top:16px"><a href="/">返回首页</a></p>` +
     `</div></body></html>`,
     {
       status: 502,
@@ -501,34 +495,30 @@ function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
 }
 
 /**
- * 生成验证页面提示（Google captcha 等）
+ * 生成验证页面提示（面向普通用户，不显示技术细节）
  */
 function buildCaptchaResponse(targetUrl, hasRelay) {
-  const suggestion = hasRelay
-    ? '中继服务器也收到了验证页面。该网站可能对所有非住宅 IP 都要求验证。'
-    : '目标网站检测到来自 Cloudflare 数据中心 IP 的请求并要求人机验证。<br>请配置 <code>RELAY_URL</code> 环境变量，使用住宅 IP 或信誉更好的 VPS 作为中继服务器。';
-
   return new Response(
     `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<style>` +
     `body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#eee;padding:60px 20px;text-align:center}` +
-    `.card{max-width:600px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.3)}` +
+    `.card{max-width:480px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.3)}` +
     `h2{color:#e94560;margin-bottom:16px}` +
     `.target{color:#888;background:#0f0f1a;padding:8px 16px;border-radius:6px;display:inline-block;margin:12px 0;word-break:break-all;font-size:13px}` +
     `.desc{color:#aaa;margin:12px 0;line-height:1.6}` +
-    `.suggestion{color:#666;font-size:13px;margin-top:20px;padding-top:20px;border-top:1px solid #1a1a3e;line-height:1.8}` +
-    `code{background:#0f0f1a;color:#e94560;padding:2px 8px;border-radius:4px;font-size:13px}` +
     `a{color:#e94560;text-decoration:none}a:hover{text-decoration:underline}` +
     `.icon{font-size:48px;margin-bottom:8px}` +
+    `.retry{display:inline-block;margin-top:20px;padding:10px 28px;background:#e94560;color:#fff;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:background .2s}` +
+    `.retry:hover{background:#c73e54}` +
     `</style></head><body>` +
     `<div class="card">` +
     `<div class="icon">&#9888;&#65039;</div>` +
-    `<h2>目标网站要求人机验证</h2>` +
+    `<h2>该网站需要验证</h2>` +
     `<div class="target">${targetUrl}</div>` +
-    `<p class="desc">该网站（如 Google）检测到代理 IP 并触发了反爬虫验证页面。<br>由于代理无法完成验证码，页面无法正常显示。</p>` +
-    `<div class="suggestion">${suggestion}</div>` +
-    `<p style="margin-top:24px"><a href="/">← 返回首页</a></p>` +
+    `<p class="desc">目标网站要求进行人机验证，暂时无法通过代理加载。<br>请稍后重试，或直接访问该网站。</p>` +
+    `<button class="retry" onclick="location.reload()">&#8635; 重试</button>` +
+    `<p style="margin-top:16px"><a href="/">返回首页</a></p>` +
     `</div></body></html>`,
     {
       status: 502,
