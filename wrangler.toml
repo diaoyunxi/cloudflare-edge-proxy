@@ -1,0 +1,6 @@
+name = "cloudflare-edge-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# 部署: npx wrangler deploy
+# 本地开发: npx wrangler dev
