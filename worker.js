@@ -447,7 +447,81 @@ function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
   );
 }
 
+/**
+ * 生成验证页面提示（Google captcha 等）
+ */
+function buildCaptchaResponse(targetUrl, hasRelay) {
+  const suggestion = hasRelay
+    ? '中继服务器也收到了验证页面。该网站可能对所有非住宅 IP 都要求验证。'
+    : '目标网站检测到来自 Cloudflare 数据中心 IP 的请求并要求人机验证。<br>请配置 <code>RELAY_URL</code> 环境变量，使用住宅 IP 或信誉更好的 VPS 作为中继服务器。';
+
+  return new Response(
+    `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<style>` +
+    `body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#eee;padding:60px 20px;text-align:center}` +
+    `.card{max-width:600px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.3)}` +
+    `h2{color:#e94560;margin-bottom:16px}` +
+    `.target{color:#888;background:#0f0f1a;padding:8px 16px;border-radius:6px;display:inline-block;margin:12px 0;word-break:break-all;font-size:13px}` +
+    `.desc{color:#aaa;margin:12px 0;line-height:1.6}` +
+    `.suggestion{color:#666;font-size:13px;margin-top:20px;padding-top:20px;border-top:1px solid #1a1a3e;line-height:1.8}` +
+    `code{background:#0f0f1a;color:#e94560;padding:2px 8px;border-radius:4px;font-size:13px}` +
+    `a{color:#e94560;text-decoration:none}a:hover{text-decoration:underline}` +
+    `.icon{font-size:48px;margin-bottom:8px}` +
+    `</style></head><body>` +
+    `<div class="card">` +
+    `<div class="icon">&#9888;&#65039;</div>` +
+    `<h2>目标网站要求人机验证</h2>` +
+    `<div class="target">${targetUrl}</div>` +
+    `<p class="desc">该网站（如 Google）检测到代理 IP 并触发了反爬虫验证页面。<br>由于代理无法完成验证码，页面无法正常显示。</p>` +
+    `<div class="suggestion">${suggestion}</div>` +
+    `<p style="margin-top:24px"><a href="/">← 返回首页</a></p>` +
+    `</div></body></html>`,
+    {
+      status: 502,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    }
+  );
+}
+
 // ==================== 代理请求 ====================
+
+/** 真实浏览器请求头模板 */
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'sec-ch-ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'none',
+  'sec-fetch-user': '?1',
+  'upgrade-insecure-requests': '1',
+};
+
+/**
+ * 检测响应是否为反爬虫验证页面（Google 等）
+ */
+function isCaptchaPage(contentType, body) {
+  if (!contentType.includes('text/html')) return false;
+  // Google 异常流量验证页面的特征
+  const signals = [
+    '我们的系统检测到您的计算机网络中存在异常流量',
+    'unusual traffic from your computer network',
+    'detected unusual traffic',
+    'captcha',
+    'g-recaptcha',
+    'sorry/index',
+    '/sorry/',
+  ];
+  const lower = body.toLowerCase();
+  return signals.some(s => lower.includes(s.toLowerCase()));
+}
 
 /**
  * 直接通过 Cloudflare 边缘节点获取目标内容
@@ -456,15 +530,23 @@ async function directFetch(targetUrl, request) {
   const target = new URL(targetUrl);
 
   const reqHeaders = new Headers();
-  const forwardHeaders = ['Accept', 'Accept-Language', 'Content-Type', 'Content-Disposition'];
-  for (const name of forwardHeaders) {
-    const val = request.headers.get(name);
-    if (val) reqHeaders.set(name, val);
+
+  // 使用真实浏览器头作为基础
+  for (const [key, val] of Object.entries(BROWSER_HEADERS)) {
+    reqHeaders.set(key, val);
   }
-  reqHeaders.set('User-Agent',
-    request.headers.get('User-Agent') ||
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  );
+
+  // 如果客户端发送了 Accept-Language，优先使用
+  const clientLang = request.headers.get('Accept-Language');
+  if (clientLang) reqHeaders.set('Accept-Language', clientLang);
+
+  // 传递 Content-Type（POST 等请求需要）
+  const contentType = request.headers.get('Content-Type');
+  if (contentType && !['GET', 'HEAD'].includes(request.method)) {
+    reqHeaders.set('Content-Type', contentType);
+  }
+
+  // 设置 Referer 为目标站点自身
   reqHeaders.set('Referer', target.origin + '/');
 
   return await fetch(targetUrl, {
@@ -527,9 +609,55 @@ async function proxyRequest(targetUrl, request, env) {
     directError = err;
   }
 
-  // 如果直接获取成功且不是边缘错误，直接处理返回
+  // 如果直接获取成功且不是边缘错误
   if (directResponse && !isCloudflareEdgeError(directResponse.status)) {
     const finalUrl = directResponse.url || targetUrl;
+    const contentType = directResponse.headers.get('Content-Type') || '';
+
+    // 检测是否为反爬虫验证页面（Google captcha 等）
+    if (contentType.includes('text/html')) {
+      try {
+        const body = await directResponse.text();
+        if (isCaptchaPage(contentType, body)) {
+          // 检测到验证页面，尝试中继
+          if (relayUrl) {
+            try {
+              const relayResponse = await relayFetch(targetUrl, request, relayUrl);
+              if (relayResponse.ok) {
+                const relayBody = await relayResponse.text();
+                const relayCt = relayResponse.headers.get('Content-Type') || '';
+                if (!isCaptchaPage(relayCt, relayBody)) {
+                  // 中继返回的不是验证页面，使用中继结果
+                  const relayHeaders = cleanHeaders(relayResponse.headers);
+                  relayHeaders.set('Content-Type', 'text/html; charset=utf-8');
+                  const rewritten = rewriteHtml(relayBody, targetUrl);
+                  return new Response(rewritten, {
+                    status: relayResponse.status,
+                    headers: relayHeaders,
+                  });
+                }
+              }
+            } catch (e) {
+              // 中继失败
+            }
+          }
+          // 中继也失败或未配置，返回验证页面提示
+          return buildCaptchaResponse(targetUrl, !!relayUrl);
+        }
+        // 不是验证页面，正常处理
+        const newHeaders = cleanHeaders(directResponse.headers);
+        newHeaders.set('Content-Type', 'text/html; charset=utf-8');
+        const rewritten = rewriteHtml(body, finalUrl);
+        return new Response(rewritten, {
+          status: directResponse.status,
+          headers: newHeaders,
+        });
+      } catch (err) {
+        return buildErrorResponse(targetUrl, 0, err.message, !!relayUrl);
+      }
+    }
+
+    // 非 HTML 内容，直接处理
     try {
       return await processResponse(directResponse, finalUrl);
     } catch (err) {
@@ -544,10 +672,7 @@ async function proxyRequest(targetUrl, request, env) {
   if (relayUrl) {
     try {
       const relayResponse = await relayFetch(targetUrl, request, relayUrl);
-
       if (relayResponse.ok || (relayResponse.status < 520 && relayResponse.status !== 0)) {
-        // 中继成功，处理响应
-        // 构造一个合成响应，使用目标 URL 作为基准
         const finalUrl = targetUrl;
         return await processResponse(relayResponse, finalUrl);
       }

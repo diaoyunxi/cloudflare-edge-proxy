@@ -108,9 +108,13 @@ pm2 start relay-server.js --name relay
 
 ## 已知限制
 
-- **登录/会话** — 不转发 Cookie，需要登录的网站可能无法正常使用
+| 网站 | 问题 | 原因 | 解决方案 |
+|------|------|------|----------|
+| GitHub | 525 SSL 握手失败 | 主动拒绝 Cloudflare IP 的 TLS 连接 | 配置中继服务器 |
+| Google | 人机验证页面 | 检测到数据中心 IP，触发反爬虫验证 | 配置中继服务器（住宅 IP 最佳） |
+| 其他需登录网站 | 无法保持会话 | 不转发 Cookie | 暂不支持 |
+
 - **WebSocket** — 暂不支持 WebSocket 代理
-- **GitHub/Google 直连** — 这些网站封锁 Cloudflare Worker IP，需配置中继服务器
 - **部分 SPA** — 高度依赖 `window.location` 的单页应用可能出现导航异常
 
 ## 文件结构
