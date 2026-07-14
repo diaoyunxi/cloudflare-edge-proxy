@@ -21,8 +21,22 @@ const http = require('http');
 const https = require('https');
 const url = require('url');
 
-const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+// ==================== 配置常量 ====================
+
+/** 默认监听端口 */
+const DEFAULT_PORT = 3000;
+
+/** 代理请求超时时间（毫秒） */
+const PROXY_TIMEOUT_MS = 15000;
+
+/** 最大重定向次数 */
+const MAX_REDIRECTS = 5;
+
+/** 307/308 状态码，重定向时需保持原始请求方法 */
+const REDIRECT_PRESERVE_METHOD_CODES = [307, 308];
+
+/** 所有重定向状态码 */
+const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
 
 // ==================== 真实浏览器请求头 ====================
 
@@ -43,16 +57,32 @@ const BROWSER_HEADERS = {
   'upgrade-insecure-requests': '1',
 };
 
+// ==================== 运行时配置 ====================
+
+const PORT = process.env.PORT || DEFAULT_PORT;
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+
+// ==================== 工具函数 ====================
+
+/**
+ * 判断是否为需要保持请求方法的重定向状态码
+ * @param {number} statusCode - HTTP 状态码
+ * @returns {boolean}
+ */
+function shouldPreserveMethod(statusCode) {
+  return REDIRECT_PRESERVE_METHOD_CODES.includes(statusCode);
+}
+
 // ==================== 主服务器 ====================
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
 
-  // CORS 头
+  // CORS 头（支持 GET/HEAD/OPTIONS，与实际代理能力一致）
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Original-URL, X-Relay-Token',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Original-URL, X-Relay-Token, X-Original-Method',
   };
 
   // 处理 OPTIONS 预检
@@ -104,10 +134,33 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // 透传原始请求方法（由 Worker 通过 X-Original-Method 头传递）
+    const originalMethod = req.headers['x-original-method'] || 'GET';
+    const needsBody = !['GET', 'HEAD'].includes(originalMethod);
+
     // 构造完整的浏览器请求头
     const headers = { ...BROWSER_HEADERS };
     headers['Referer'] = target.origin + '/';
     headers['Host'] = target.host;
+
+    // 非默认 GET 方法时，透传 Content-Type
+    if (needsBody) {
+      const reqContentType = req.headers['content-type'];
+      if (reqContentType) {
+        headers['Content-Type'] = reqContentType;
+      }
+    }
+
+    // 缓冲请求体（需要 body 的方法先收集完整 body，防止重定向时流已消耗）
+    let bodyBuffer = Buffer.alloc(0);
+    if (needsBody) {
+      bodyBuffer = await new Promise((resolve) => {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => resolve(Buffer.concat(chunks)));
+        req.on('error', () => resolve(Buffer.alloc(0)));
+      });
+    }
 
     const lib = target.protocol === 'https:' ? https : http;
 
@@ -115,55 +168,96 @@ const server = http.createServer((req, res) => {
       hostname: target.hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
       path: target.pathname + target.search,
-      method: 'GET',
+      method: originalMethod,
       headers: headers,
     };
 
     const proxyReq = lib.request(options, (proxyRes) => {
       // 如果是重定向，跟随重定向
-      if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+      if (REDIRECT_STATUS_CODES.includes(proxyRes.statusCode) && proxyRes.headers.location) {
         const redirectUrl = new URL(proxyRes.headers.location, targetUrl).href;
-        // 递归跟随重定向（最多 5 次）
         const redirectCount = parseInt(parsedUrl.query._redirect || '0');
-        if (redirectCount < 5) {
-          let redirectPath = `/fetch?url=${encodeURIComponent(redirectUrl)}&_redirect=${redirectCount + 1}`;
-          if (AUTH_TOKEN) redirectPath += `&token=${AUTH_TOKEN}`;
-          const redirectReq = http.request({
-            hostname: 'localhost',
-            port: PORT,
-            path: redirectPath,
-            method: 'GET',
-          }, (redirectRes) => {
-            const headers = { ...redirectRes.headers, ...corsHeaders };
-            delete headers['content-length'];
-            delete headers['transfer-encoding'];
-            delete headers['content-encoding'];
-            res.writeHead(redirectRes.statusCode, headers);
-            redirectRes.pipe(res);
-          });
-          redirectReq.on('error', () => {
-            res.writeHead(502, { 'Content-Type': 'text/plain', ...corsHeaders });
-            res.end('Redirect failed');
-          });
-          redirectReq.end();
+
+        if (redirectCount >= MAX_REDIRECTS) {
+          // 【严重缺陷 3.6 修复】超过最大重定向次数，终止循环并返回 508
+          res.writeHead(508, { 'Content-Type': 'text/plain', ...corsHeaders });
+          res.end('Loop Detected');
           return;
         }
+
+        // 消耗 proxyRes 响应体（重定向响应体通常为空，但仍需消费）
+        proxyRes.resume();
+
+        // 【锦上添花修复】307/308 重定向保持原始请求方法
+        const redirectMethod = shouldPreserveMethod(proxyRes.statusCode) ? originalMethod : 'GET';
+
+        let redirectPath = `/fetch?url=${encodeURIComponent(redirectUrl)}&_redirect=${redirectCount + 1}`;
+        if (AUTH_TOKEN) redirectPath += `&token=${AUTH_TOKEN}`;
+        // 透传原始方法给重定向请求
+        if (redirectMethod !== 'GET') {
+          redirectPath += `&_method=${redirectMethod}`;
+        }
+        const redirectReq = http.request({
+          hostname: 'localhost',
+          port: PORT,
+          path: redirectPath,
+          method: redirectMethod,
+          headers: {
+            'Content-Type': req.headers['content-type'] || 'application/octet-stream',
+            'X-Original-Method': originalMethod,
+          },
+        }, (redirectRes) => {
+          const respHeaders = { ...redirectRes.headers, ...corsHeaders };
+          delete respHeaders['content-length'];
+          delete respHeaders['transfer-encoding'];
+          delete respHeaders['content-encoding'];
+          res.writeHead(redirectRes.statusCode, respHeaders);
+          redirectRes.pipe(res);
+        });
+        redirectReq.on('error', () => {
+          res.writeHead(502, { 'Content-Type': 'text/plain', ...corsHeaders });
+          res.end('Bad Gateway');
+        });
+
+        // 307/308 且有 body 时，从缓冲区写入
+        if (shouldPreserveMethod(proxyRes.statusCode) && bodyBuffer.length > 0) {
+          redirectReq.write(bodyBuffer);
+        }
+        redirectReq.end();
+        return;
       }
 
-      const headers = { ...proxyRes.headers, ...corsHeaders };
-      delete headers['content-length'];
-      delete headers['transfer-encoding'];
-      delete headers['content-encoding'];
+      const respHeaders = { ...proxyRes.headers, ...corsHeaders };
+      delete respHeaders['content-length'];
+      delete respHeaders['transfer-encoding'];
+      delete respHeaders['content-encoding'];
 
-      res.writeHead(proxyRes.statusCode, headers);
+      res.writeHead(proxyRes.statusCode, respHeaders);
       proxyRes.pipe(res);
     });
 
-    proxyReq.on('error', (err) => {
-      res.writeHead(502, { 'Content-Type': 'text/plain', ...corsHeaders });
-      res.end('Fetch failed: ' + err.message);
+    // 【严重缺陷 3.4 修复】添加请求超时控制
+    proxyReq.setTimeout(PROXY_TIMEOUT_MS, () => {
+      proxyReq.destroy();
+      if (!res.headersSent) {
+        res.writeHead(504, { 'Content-Type': 'text/plain', ...corsHeaders });
+        res.end('Gateway Timeout');
+      }
     });
 
+    // 【严重缺陷 3.5 修复】错误信息脱敏，不暴露内部细节
+    proxyReq.on('error', (err) => {
+      console.error('Proxy fetch failed:', err.message);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain', ...corsHeaders });
+        res.end('Bad Gateway');
+      }
+    });
+
+    // 【严重缺陷 3.2 修复】非 GET/HEAD 时从缓冲区写入请求体
+    if (needsBody && bodyBuffer.length > 0) {
+      proxyReq.write(bodyBuffer);
+    }
     proxyReq.end();
     return;
   }
@@ -176,7 +270,8 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`中继服务器已启动，端口: ${PORT}`);
   console.log(`使用方法: http://localhost:${PORT}/fetch?url=<目标网址>`);
+  // 【严重缺陷 3.1 修复】AUTH_TOKEN 脱敏，不打印明文
   if (AUTH_TOKEN) {
-    console.log(`已启用鉴权，令牌: ${AUTH_TOKEN}`);
+    console.log('已启用鉴权，令牌: ***');
   }
 });

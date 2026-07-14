@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-edge-proxy",
-  "version": "1.0.0",
+  "version": "1.6.0",
   "description": "Edge proxy for Cloudflare Workers that enables iframe embedding of restricted websites (like GitHub) by stripping X-Frame-Options and CSP headers.",
   "main": "worker.js",
   "scripts": {
