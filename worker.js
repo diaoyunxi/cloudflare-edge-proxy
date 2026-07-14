@@ -16,6 +16,8 @@
  *   CF_API_TOKEN     - Cloudflare API 令牌（用于自动更新）
  *   CF_ACCOUNT_ID    - Cloudflare 账户 ID（用于自动更新）
  *   CF_SCRIPT_NAME   - Worker 脚本名称（用于自动更新）
+ *   PROXY_API_KEY    - 代理认证密钥（可选，配置后启用 API Key 认证）
+ *   RATE_LIMIT       - 每 IP 每分钟最大请求数（可选，默认 60）
  */
 
 // ==================== 配置常量 ====================
@@ -25,13 +27,22 @@ const CONFIG = {
   VERSION: 'v1.5.0',
   /** GitHub 仓库（用于自动更新） */
   GITHUB_REPO: 'diaoyunxi/cloudflare-edge-proxy',
-  /** 代理请求超时时间（毫秒） */
-  PROXY_TIMEOUT_MS: 15000,
+  /** 代理请求超时时间（毫秒），降低到 10s 避免长时间阻塞边缘节点 */
+  PROXY_TIMEOUT_MS: 10000,
   /** 最大重定向次数（与 relay-server 保持一致） */
   MAX_REDIRECTS: 5,
   /** 自动更新检查间隔（毫秒） */
   UPDATE_CHECK_INTERVAL_MS: 24 * 60 * 60 * 1000,
+  /** 频率限制：每个 IP 每分钟最大请求数（通过 env.RATE_LIMIT 自定义，默认 60） */
+  RATE_LIMIT_PER_MINUTE: 60,
+  /** 频率限制：历史记录清理间隔（毫秒） */
+  RATE_LIMIT_CLEANUP_MS: 5 * 60 * 1000,
 };
+
+/** 代理页面的基本 CSP 头，限制脚本来源，防止代理页面执行恶意脚本 */
+const PROXY_CSP = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
+  "script-src * 'unsafe-inline' 'unsafe-eval'; " +
+  "frame-ancestors 'self'";
 
 // 从 CONFIG 中导出常用引用，保持兼容
 const CURRENT_VERSION = CONFIG.VERSION;
@@ -90,7 +101,7 @@ iframe{width:100%;height:100%;border:none}
 </div>
 <div class="frame-wrap">
   <div class="loading" id="ld"><div class="spin"></div>加载中…</div>
-  <iframe id="f" referrerpolicy="no-referrer" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals"></iframe>
+  <iframe id="f" referrerpolicy="no-referrer" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals"></iframe>
 </div>
 <script>
 const I=document.getElementById('u'),G=document.getElementById('g'),F=document.getElementById('f'),L=document.getElementById('ld'),H=document.getElementById('h');
@@ -135,80 +146,185 @@ function isCloudflareEdgeError(status) {
   return status >= 520 && status <= 526;
 }
 
+/**
+ * 验证 URL 是否为安全的公网地址，禁止内网地址防止 SSRF 攻击
+ * 禁止：127.x、10.x、192.168.x、169.254.x、172.16-31.x、::1、localhost、IPv6 内网/链路本地
+ * @param {string} urlStr - 待验证的 URL
+ * @returns {boolean} true 表示安全（公网地址），false 表示内网或非法地址
+ */
+function validateRelayUrl(urlStr) {
+  let parsed;
+  try {
+    parsed = new URL(urlStr);
+  } catch {
+    return false;
+  }
+  // 仅允许 http/https 协议
+  if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+
+  const host = parsed.hostname.toLowerCase();
+
+  // 禁止 localhost
+  if (host === 'localhost') return false;
+
+  // 禁止 IPv6 回环和内网
+  if (host === '::1' || host === '[::1]') return false;
+  if (host.startsWith('fc') || host.startsWith('fd')) return false; // IPv6 ULA
+  if (host.startsWith('fe80')) return false; // IPv6 链路本地
+  if (host.startsWith('::ffff:')) return false; // IPv4-mapped IPv6
+
+  // 去除 IPv6 方括号
+  const cleanHost = host.replace(/^\[|\]$/g, '');
+
+  // 禁止 IPv4 内网地址
+  if (/^127\./.test(cleanHost)) return false;
+  if (/^10\./.test(cleanHost)) return false;
+  if (/^192\.168\./.test(cleanHost)) return false;
+  if (/^169\.254\./.test(cleanHost)) return false;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(cleanHost)) return false;
+  if (/^0\./.test(cleanHost)) return false; // 0.0.0.0/8
+
+  return true;
+}
+
+/**
+ * HTML 转义，防止 XSS 攻击
+ * @param {string} str - 原始字符串
+ * @returns {string} 转义后的安全字符串
+ */
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ==================== 内容重写 ====================
 
 /**
- * 重写 HTML 中的所有 URL，使其通过代理
+ * 使用 Cloudflare Worker 原生 HTMLRewriter API 重写 HTML 中的所有 URL
+ * 相比正则解析，HTMLRewriter 能正确处理 HTML 结构，避免正则匹配不完整导致的遗漏与误改
+ * @param {string} html - 原始 HTML 文本
+ * @param {string} baseUrl - 基准 URL（用于解析相对路径）
+ * @returns {Promise<string>} 重写后的 HTML
  */
-function rewriteHtml(html, baseUrl) {
-  html = html.replace(/<base\s[^>]*>/gi, '');
-  html = html.replace(/<meta\s+charset=["']?[^"'>\s]*/gi, '<meta charset="UTF-8"');
-  html = html.replace(
-    /(<meta\s+http-equiv=["']Content-Type["']\s+content=["']text\/html;\s*charset=)[^"']*/gi,
-    '$1UTF-8'
-  );
-  html = html.replace(/<link\s+[^>]*rel=["'](preconnect|dns-prefetch)["'][^>]*>/gi, '');
-  html = html.replace(/\s+integrity\s*=\s*["'][^"']*["']/gi, '');
-  html = html.replace(/\s+crossorigin\s*=\s*["'][^"']*["']/gi, '');
-  html = html.replace(/\s+crossorigin(?=[\s>])/gi, '');
-
-  html = html.replace(
-    /((?:src|href|action|poster)\s*=\s*["'])([^"']*)(["'])/gi,
-    (match, prefix, url, suffix) => {
-      if (!url || /^(data:|javascript:|blob:|#|mailto:|tel:)/i.test(url)) return match;
-      // 跳过已经是本代理路径的 URL，避免嵌套编码
-      if (url.startsWith('/proxy/') || url.startsWith('//proxy/')) return match;
-      const resolved = resolveUrl(baseUrl, url);
-      if (resolved) return prefix + '/proxy/' + encodeUrl(resolved) + suffix;
-      return match;
-    }
-  );
-
-  html = html.replace(
-    /(srcset\s*=\s*["'])([^"']*)(["'])/gi,
-    (match, prefix, srcset, suffix) => {
-      const newSrcset = srcset.split(',').map(part => {
-        const trimmed = part.trim();
-        const [url, ...descriptor] = trimmed.split(/\s+/);
-        if (!url || /^(data:|blob:)/i.test(url)) return part;
-        const resolved = resolveUrl(baseUrl, url);
-        if (resolved) return '/proxy/' + encodeUrl(resolved) + (descriptor.length ? ' ' + descriptor.join(' ') : '');
-        return part;
-      }).join(', ');
-      return prefix + newSrcset + suffix;
-    }
-  );
-
-  html = html.replace(
-    /(<meta\s+http-equiv=["']refresh["']\s+content=["'][^;]*;\s*url=)([^"']*)(["'])/gi,
-    (match, prefix, url, suffix) => {
-      const resolved = resolveUrl(baseUrl, url.trim());
-      if (resolved) return prefix + '/proxy/' + encodeUrl(resolved) + suffix;
-      return match;
-    }
-  );
-
-  html = html.replace(
-    /url\(["']?([^"')]+)["']?\)/gi,
-    (match, url) => {
-      if (!url || /^(data:|blob:)/i.test(url)) return match;
-      if (url.startsWith('/proxy/') || url.startsWith('//proxy/')) return match;
-      const resolved = resolveUrl(baseUrl, url);
-      if (resolved) return 'url(/proxy/' + encodeUrl(resolved) + ')';
-      return match;
-    }
-  );
-
+async function rewriteHtml(html, baseUrl) {
   const injectScript = getInjectedScript(baseUrl);
-  if (html.includes('</body>')) {
-    html = html.replace('</body>', injectScript + '\n</body>');
-  } else if (html.includes('</html>')) {
-    html = html.replace('</html>', injectScript + '\n</html>');
-  } else {
-    html += injectScript;
+
+  /** 重写单个 URL 属性值，返回 null 表示无需重写 */
+  function rewriteUrlAttr(val) {
+    if (!val || /^(data:|javascript:|blob:|#|mailto:|tel:)/i.test(val)) return null;
+    if (val.startsWith('/proxy/') || val.startsWith('//proxy/')) return null;
+    return resolveUrl(baseUrl, val);
   }
 
-  return html;
+  /** 重写 srcset 属性值中的所有 URL */
+  function rewriteSrcsetValue(srcset) {
+    return srcset.split(',').map(part => {
+      const trimmed = part.trim();
+      const [url, ...descriptor] = trimmed.split(/\s+/);
+      if (!url || /^(data:|blob:)/i.test(url)) return part;
+      if (url.startsWith('/proxy/') || url.startsWith('//proxy/')) return part;
+      const resolved = resolveUrl(baseUrl, url);
+      if (resolved) return '/proxy/' + encodeUrl(resolved) + (descriptor.length ? ' ' + descriptor.join(' ') : '');
+      return part;
+    }).join(', ');
+  }
+
+  // 累积 <style> 标签内的 CSS 文本（可能跨多个 text chunk）
+  let styleBuffer = '';
+
+  const rewriter = new HTMLRewriter()
+    // 移除 <base> 标签，避免干扰相对路径解析
+    .on('base', { element(el) { el.remove(); } })
+    // 处理 <meta> 标签：charset、Content-Type、refresh
+    .on('meta', {
+      element(el) {
+        const charset = el.getAttribute('charset');
+        if (charset) { el.setAttribute('charset', 'UTF-8'); return; }
+        const httpEquiv = (el.getAttribute('http-equiv') || '').toLowerCase();
+        if (httpEquiv === 'content-type') {
+          el.setAttribute('content', 'text/html; charset=UTF-8');
+          return;
+        }
+        if (httpEquiv === 'refresh') {
+          const content = el.getAttribute('content') || '';
+          const m = content.match(/^(.*?url=)([^;]*)$/i);
+          if (m) {
+            const resolved = resolveUrl(baseUrl, m[2].trim());
+            if (resolved) el.setAttribute('content', m[1] + '/proxy/' + encodeUrl(resolved));
+          }
+        }
+      }
+    })
+    // 移除 preconnect/dns-prefetch link 标签
+    .on('link', {
+      element(el) {
+        const rel = (el.getAttribute('rel') || '').toLowerCase();
+        if (rel === 'preconnect' || rel === 'dns-prefetch') { el.remove(); }
+      }
+    })
+    // 重写 <style> 标签内的 CSS url() 引用
+    .on('style', {
+      text(text) {
+        styleBuffer += text.text;
+        if (text.lastInTextNode) {
+          const rewritten = rewriteCss(styleBuffer, baseUrl);
+          // 前面的 chunk 已被 remove，最后一个 chunk 替换为完整重写后的 CSS
+          text.replace(rewritten, { html: false });
+          styleBuffer = '';
+        } else {
+          text.remove();
+        }
+      }
+    })
+    // 通用处理：所有元素的属性重写
+    .on('*', {
+      element(el) {
+        // 移除 SRI 完整性校验和跨域属性（代理已重写资源 URL，原始校验值不再适用）
+        el.removeAttribute('integrity');
+        el.removeAttribute('crossorigin');
+        // 重写 src 属性
+        const src = el.getAttribute('src');
+        if (src) { const r = rewriteUrlAttr(src); if (r) el.setAttribute('src', '/proxy/' + encodeUrl(r)); }
+        // 重写 href 属性
+        const href = el.getAttribute('href');
+        if (href) { const r = rewriteUrlAttr(href); if (r) el.setAttribute('href', '/proxy/' + encodeUrl(r)); }
+        // 重写 action 属性
+        const action = el.getAttribute('action');
+        if (action) { const r = rewriteUrlAttr(action); if (r) el.setAttribute('action', '/proxy/' + encodeUrl(r)); }
+        // 重写 poster 属性
+        const poster = el.getAttribute('poster');
+        if (poster) { const r = rewriteUrlAttr(poster); if (r) el.setAttribute('poster', '/proxy/' + encodeUrl(r)); }
+        // 重写 srcset 属性
+        const srcset = el.getAttribute('srcset');
+        if (srcset) { el.setAttribute('srcset', rewriteSrcsetValue(srcset)); }
+        // 重写 inline style 中的 url()
+        const style = el.getAttribute('style');
+        if (style) { el.setAttribute('style', rewriteCss(style, baseUrl)); }
+      }
+    });
+
+  // 创建临时 Response 供 HTMLRewriter 处理
+  const tempResponse = new Response(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
+  const transformed = rewriter.transform(tempResponse);
+  let result = await transformed.text();
+
+  // 注入客户端拦截脚本
+  if (result.includes('</body>')) {
+    result = result.replace('</body>', injectScript + '\n</body>');
+  } else if (result.includes('</html>')) {
+    result = result.replace('</html>', injectScript + '\n</html>');
+  } else {
+    result += injectScript;
+  }
+
+  return result;
 }
 
 /** 重写 CSS 中的 url() 引用 */
@@ -399,6 +515,9 @@ function cleanHeaders(headers) {
   h.delete('Set-Cookie2');
   h.delete('Link');
   h.delete('Strict-Transport-Security');
+  // 添加基本 CSP 头，限制代理页面的脚本来源，防止恶意脚本执行
+  // 允许加载外部资源（代理必需），但限制 frame-ancestors 仅允许自身嵌入
+  h.set('Content-Security-Policy', PROXY_CSP);
   return h;
 }
 
@@ -417,7 +536,7 @@ async function processResponse(response, finalUrl) {
   // ---- HTML ----
   if (contentType.includes('text/html')) {
     let html = await response.text();
-    html = rewriteHtml(html, finalUrl);
+    html = await rewriteHtml(html, finalUrl);
     newHeaders.set('Content-Type', 'text/html; charset=utf-8');
     return new Response(html, {
       status: response.status,
@@ -538,7 +657,7 @@ function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
     `<div class="card">` +
     `<div class="icon">&#128533;</div>` +
     `<h2>${title}</h2>` +
-    `<div class="target">${targetUrl}</div>` +
+    `<div class="target">${escapeHtml(targetUrl)}</div>` +
     `<p class="desc">${desc}</p>` +
     `<button class="retry" onclick="location.reload()">&#8635; 重试</button>` +
     `<p style="margin-top:16px"><a href="/">返回首页</a></p>` +
@@ -552,8 +671,9 @@ function buildErrorResponse(targetUrl, statusCode, errorMsg, hasRelay) {
 
 // ==================== 代理请求 ====================
 
-/** 真实浏览器请求头模板 */
+/** 真实浏览器请求头模板（User-Agent 为默认值，运行时优先使用客户端实际 UA） */
 const BROWSER_HEADERS = {
+  /** 默认 User-Agent，当客户端请求头中无 UA 时使用 */
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -584,6 +704,12 @@ async function directFetch(targetUrl, request) {
   // 使用真实浏览器头作为基础
   for (const [key, val] of Object.entries(BROWSER_HEADERS)) {
     reqHeaders.set(key, val);
+  }
+
+  // 【一般问题修复】动态从请求头获取 User-Agent，避免硬编码导致指纹特征固定
+  const clientUA = request.headers.get('User-Agent');
+  if (clientUA) {
+    reqHeaders.set('User-Agent', clientUA);
   }
 
   // 如果客户端发送了 Accept-Language，优先使用
@@ -629,6 +755,11 @@ async function directFetch(targetUrl, request) {
  * @returns {Promise<Response>}
  */
 async function relayFetch(targetUrl, request, relayUrl) {
+  // 【严重缺陷修复】SSRF 防护：验证目标 URL 不是内网地址
+  if (!validateRelayUrl(targetUrl)) {
+    return new Response('Blocked: target URL is internal or invalid', { status: 403 });
+  }
+
   const relayTarget = relayUrl + encodeURIComponent(targetUrl);
 
   const relayHeaders = {
@@ -675,6 +806,11 @@ async function proxyRequest(targetUrl, request, env) {
     return new Response('Unsupported protocol', { status: 403 });
   }
 
+  // 【严重缺陷修复】SSRF 防护：禁止代理访问内网地址
+  if (!validateRelayUrl(targetUrl)) {
+    return new Response('Blocked: target URL is internal or invalid', { status: 403 });
+  }
+
   // ---- 第一步：尝试直接获取 ----
   let directResponse = null;
   let directError = null;
@@ -701,7 +837,7 @@ async function proxyRequest(targetUrl, request, env) {
         const body = await directResponse.text();
         const newHeaders = cleanHeaders(directResponse.headers);
         newHeaders.set('Content-Type', 'text/html; charset=utf-8');
-        const rewritten = rewriteHtml(body, finalUrl);
+        const rewritten = await rewriteHtml(body, finalUrl);
         return new Response(rewritten, {
           status: directResponse.status,
           headers: newHeaders,
@@ -829,7 +965,11 @@ async function checkForUpdate(env) {
   // 发现新版本，下载 worker.js
   // 优先从 release assets 下载
   let code = null;
+  let expectedHash = null;
   const asset = release.assets && release.assets.find(a => a.name === 'worker.js');
+  // 查找 hash 校验文件（worker.js.sha256 或 worker.js.hash）
+  const hashAsset = release.assets && release.assets.find(a => /worker\.js\.(sha256|hash)$/i.test(a.name));
+
   if (asset && asset.browser_download_url) {
     try {
       const codeResp = await fetch(asset.browser_download_url, {
@@ -841,6 +981,22 @@ async function checkForUpdate(env) {
       }
     } catch {
       // GitHub 下载可能被封锁，尝试备用方案
+    }
+  }
+
+  // 【严重缺陷修复】下载 hash 校验文件用于完整性校验
+  if (hashAsset && hashAsset.browser_download_url) {
+    try {
+      const hashResp = await fetch(hashAsset.browser_download_url, {
+        headers: { 'User-Agent': 'EdgeProxy-SelfUpdate' },
+        redirect: 'follow',
+      });
+      if (hashResp.ok) {
+        expectedHash = (await hashResp.text()).trim().toLowerCase();
+      }
+    } catch {
+      // hash 文件下载失败，不阻塞更新流程，但记录警告
+      console.warn('Update: hash file download failed, integrity check will be skipped');
     }
   }
 
@@ -861,6 +1017,39 @@ async function checkForUpdate(env) {
 
   if (!code) return;
 
+  // 【严重缺陷修复】SHA256 完整性校验：计算下载代码的哈希并与 release assets 中的 hash 文件对比
+  if (expectedHash) {
+    try {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(code);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const actualHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      // hash 文件可能包含文件名后缀（如 "abc123 worker.js"），取第一个字段
+      const expectedClean = expectedHash.split(/\s+/)[0];
+      if (actualHash !== expectedClean) {
+        console.error(`Update: SHA256 mismatch! expected=${expectedClean}, actual=${actualHash}`);
+        // 哈希不匹配，拒绝更新，记录失败信息到缓存
+        await cache.put(cacheKey, new Response(JSON.stringify({
+          lastCheck: new Date().toISOString(),
+          latestVersion: latestVersion,
+          updated: false,
+          error: 'SHA256 verification failed',
+          rolledBack: true,
+        }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'max-age=86400',
+          },
+        }));
+        return;
+      }
+      console.log('Update: SHA256 verification passed');
+    } catch (verifyErr) {
+      console.error('Update: SHA256 verification error:', verifyErr);
+    }
+  }
+
   // 上传新代码到 Cloudflare Workers
   const metadata = {
     main_module: 'worker.js',
@@ -870,6 +1059,8 @@ async function checkForUpdate(env) {
       { name: 'CF_ACCOUNT_ID', type: 'inherit' },
       { name: 'CF_SCRIPT_NAME', type: 'inherit' },
       { name: 'RELAY_URL', type: 'inherit' },
+      { name: 'PROXY_API_KEY', type: 'inherit' },
+      { name: 'RATE_LIMIT', type: 'inherit' },
     ],
   };
 
@@ -899,10 +1090,122 @@ async function checkForUpdate(env) {
           'Cache-Control': 'max-age=86400',
         },
       }));
+    } else {
+      // 【一般问题修复】上传失败，记录回滚信息到缓存
+      const errText = await uploadResp.text().catch(() => 'unknown');
+      console.error(`Update: upload failed, status=${uploadResp.status}, resp=${errText}`);
+      await cache.put(cacheKey, new Response(JSON.stringify({
+        lastCheck: new Date().toISOString(),
+        latestVersion: latestVersion,
+        updated: false,
+        error: `Upload failed: HTTP ${uploadResp.status}`,
+        rolledBack: true,
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'max-age=86400',
+        },
+      }));
     }
-  } catch {
-    // 上传失败，静默处理
+  } catch (uploadErr) {
+    // 【一般问题修复】上传异常，记录回滚信息到缓存
+    console.error('Update: upload exception:', uploadErr);
+    await cache.put(cacheKey, new Response(JSON.stringify({
+      lastCheck: new Date().toISOString(),
+      latestVersion: latestVersion,
+      updated: false,
+      error: 'Upload exception',
+      rolledBack: true,
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'max-age=86400',
+      },
+    }));
   }
+}
+
+// ==================== 访问日志 ====================
+
+/**
+ * 记录代理请求的访问日志
+ * @param {Request} request - 原始请求
+ * @param {string} targetUrl - 目标 URL
+ * @param {number} status - 响应状态码
+ * @param {string} method - 请求方法
+ */
+function logProxyAccess(request, targetUrl, status, method) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const ua = request.headers.get('User-Agent') || 'unknown';
+  const ts = new Date().toISOString();
+  console.log(`[ACCESS] ${ts} | ${ip} | ${method} | ${status} | ${targetUrl} | UA=${ua.substring(0, 80)}`);
+}
+
+// ==================== 代理认证 ====================
+
+/**
+ * 验证代理请求的 API Key 认证
+ * 当环境变量 PROXY_API_KEY 配置时启用认证，请求需携带 X-Proxy-Key 头或 ?key= 参数
+ * @param {Request} request - 原始请求
+ * @param {Object} env - 环境变量
+ * @returns {boolean} true 表示认证通过或未启用认证
+ */
+function checkProxyAuth(request, env) {
+  const apiKey = env?.PROXY_API_KEY;
+  // 未配置 API Key 则不启用认证
+  if (!apiKey) return true;
+  // 从请求头或查询参数中获取 Key
+  const headerKey = request.headers.get('X-Proxy-Key');
+  const url = new URL(request.url);
+  const queryKey = url.searchParams.get('key');
+  const providedKey = headerKey || queryKey;
+  if (!providedKey) return false;
+  // 常量时间比较，防止时序攻击
+  if (providedKey.length !== apiKey.length) return false;
+  let diff = 0;
+  for (let i = 0; i < apiKey.length; i++) {
+    diff |= providedKey.charCodeAt(i) ^ apiKey.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+// ==================== 频率限制 ====================
+
+/** 频率限制状态：key=IP, value={ count, windowStart } */
+const rateLimitMap = new Map();
+/** 上次清理时间 */
+let lastRateLimitCleanup = Date.now();
+
+/**
+ * 检查请求频率是否超限
+ * 使用内存 Map 实现简单的滑动窗口限流，每个 IP 每分钟最多 RATE_LIMIT_PER_MINUTE 次请求
+ * @param {Request} request - 原始请求
+ * @param {Object} env - 环境变量
+ * @returns {boolean} true 表示未超限，false 表示已被限流
+ */
+function checkRateLimit(request, env) {
+  const limit = parseInt(env?.RATE_LIMIT, 10) || CONFIG.RATE_LIMIT_PER_MINUTE;
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const now = Date.now();
+
+  // 定期清理过期记录，防止 Map 无限增长
+  if (now - lastRateLimitCleanup > CONFIG.RATE_LIMIT_CLEANUP_MS) {
+    for (const [key, val] of rateLimitMap.entries()) {
+      if (now - val.windowStart > 60000) {
+        rateLimitMap.delete(key);
+      }
+    }
+    lastRateLimitCleanup = now;
+  }
+
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now - entry.windowStart > 60000) {
+    // 新窗口
+    rateLimitMap.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= limit;
 }
 
 // ==================== 主入口 ====================
@@ -947,6 +1250,7 @@ export default {
           updateInfo.lastCheck = data.lastCheck;
           updateInfo.latest = data.latestVersion;
           updateInfo.updated = data.updated || false;
+          updateInfo.rolledBack = data.rolledBack || false;
         }
       } catch {}
 
@@ -968,11 +1272,34 @@ export default {
         return new Response('Missing target URL', { status: 400 });
       }
 
+      // 【优化】代理认证：验证 API Key
+      if (!checkProxyAuth(request, env)) {
+        logProxyAccess(request, '(auth failed)', 401, request.method);
+        return new Response('Unauthorized: invalid or missing API key', { status: 401 });
+      }
+
+      // 【优化】频率限制：检查请求频率
+      if (!checkRateLimit(request, env)) {
+        logProxyAccess(request, '(rate limited)', 429, request.method);
+        return new Response('Too Many Requests', { status: 429 });
+      }
+
       let targetUrl;
       try {
         targetUrl = decodeUrl(encoded);
       } catch {
         return new Response('Invalid URL encoding', { status: 400 });
+      }
+
+      // 【严重缺陷修复】decodeUrl 返回后立即校验协议，仅允许 http/https
+      let parsedTarget;
+      try {
+        parsedTarget = new URL(targetUrl);
+      } catch {
+        return new Response('Invalid URL', { status: 400 });
+      }
+      if (!['http:', 'https:'].includes(parsedTarget.protocol)) {
+        return new Response('Unsupported protocol: only http and https are allowed', { status: 403 });
       }
 
       // 追加 query string
@@ -988,6 +1315,9 @@ export default {
           // ignore
         }
       }
+
+      // 【优化】记录访问日志
+      logProxyAccess(request, targetUrl, 0, request.method);
 
       return proxyRequest(targetUrl, request, env);
     }
