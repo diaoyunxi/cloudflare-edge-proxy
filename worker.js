@@ -40,8 +40,14 @@ const CONFIG = {
 };
 
 /** 代理页面的基本 CSP 头，限制脚本来源，防止代理页面执行恶意脚本 */
-const PROXY_CSP = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
-  "script-src * 'unsafe-inline' 'unsafe-eval'; " +
+/**
+ * ⚠️ 安全说明：
+ * 'unsafe-inline' 保留是因为代理页面的内联样式/脚本需要正常工作
+ * 'unsafe-eval' 已移除——大多数网站不需要 eval()，保留它会允许 XSS 攻击执行任意代码
+ * 如需为特定网站启用 eval，请在 CSP 中添加 'unsafe-eval' 并限制 script-src 到可信域名
+ */
+const PROXY_CSP = "default-src * 'unsafe-inline' data: blob:; " +
+  "script-src * 'unsafe-inline'; " +
   "frame-ancestors 'self'";
 
 // 从 CONFIG 中导出常用引用，保持兼容
