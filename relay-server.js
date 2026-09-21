@@ -57,6 +57,44 @@ const BROWSER_HEADERS = {
   'upgrade-insecure-requests': '1',
 };
 
+// ==================== SSRF 防护 ====================
+
+/**
+ * 私有/保留 IP 地址范围，禁止中继服务器访问
+ * 防止攻击者通过中继服务器扫描内网或访问元数据服务
+ */
+const BLOCKED_HOSTNAMES = new Set([
+  'localhost',
+  '0.0.0.0',
+  '127.0.0.1',
+  '::1',
+  'metadata.google.internal',   // GCP metadata
+  '169.254.169.254',            // AWS/Azure/GCP metadata
+]);
+
+const BLOCKED_IP_RANGES = [
+  /^10\./,                    // 10.0.0.0/8
+  /^172\.(1[6-9]|2[0-9]|3[01])\./, // 172.16.0.0/12
+  /^192\.168\./,             // 192.168.0.0/16
+  /^127\./,                   // 127.0.0.0/8
+  /^0\./,                     // 0.0.0.0/8
+  /^169\.254\./,             // link-local / cloud metadata
+  /^::1/,                      // IPv6 loopback
+  /^fe80:/i,                   // IPv6 link-local
+  /^fc00:/i,                   // IPv6 unique local
+  /^fd/i,                      // IPv6 unique local
+];
+
+/**
+ * 检查目标主机名/IP 是否为内网地址（SSRF 防护）
+ * @param {string} hostname - 目标主机名或 IP
+ * @returns {boolean} true 表示被阻止
+ */
+function isBlockedHost(hostname) {
+  if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) return true;
+  return BLOCKED_IP_RANGES.some(re => re.test(hostname));
+}
+
 // ==================== 运行时配置 ====================
 
 const PORT = process.env.PORT || DEFAULT_PORT;
@@ -131,6 +169,13 @@ const server = http.createServer(async (req, res) => {
     if (!['http:', 'https:'].includes(target.protocol)) {
       res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
       res.end('Unsupported protocol');
+      return;
+    }
+
+    // SSRF 防护：阻止访问内网地址和云元数据服务
+    if (isBlockedHost(target.hostname)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+      res.end('Blocked: target host is in private/reserved IP range (SSRF protection)');
       return;
     }
 
