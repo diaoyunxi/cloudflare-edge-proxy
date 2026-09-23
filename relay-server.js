@@ -191,21 +191,22 @@ const server = http.createServer(async (req, res) => {
         // 【锦上添花修复】307/308 重定向保持原始请求方法
         const redirectMethod = shouldPreserveMethod(proxyRes.statusCode) ? originalMethod : 'GET';
 
-        let redirectPath = `/fetch?url=${encodeURIComponent(redirectUrl)}&_redirect=${redirectCount + 1}`;
-        if (AUTH_TOKEN) redirectPath += `&token=${AUTH_TOKEN}`;
+        const redirectPath = `/fetch?url=${encodeURIComponent(redirectUrl)}&_redirect=${redirectCount + 1}`;
         // 透传原始方法给重定向请求
-        if (redirectMethod !== 'GET') {
-          redirectPath += `&_method=${redirectMethod}`;
+        const redirectHeaders = {
+          'Content-Type': req.headers['content-type'] || 'application/octet-stream',
+          'X-Original-Method': originalMethod,
+        };
+        // 安全修复：通过请求头传递 token，避免 token 出现在 URL 查询参数中（CWE-598）
+        if (AUTH_TOKEN) {
+          redirectHeaders['X-Relay-Token'] = AUTH_TOKEN;
         }
         const redirectReq = http.request({
           hostname: 'localhost',
           port: PORT,
           path: redirectPath,
           method: redirectMethod,
-          headers: {
-            'Content-Type': req.headers['content-type'] || 'application/octet-stream',
-            'X-Original-Method': originalMethod,
-          },
+          headers: redirectHeaders,
         }, (redirectRes) => {
           const respHeaders = { ...redirectRes.headers, ...corsHeaders };
           delete respHeaders['content-length'];
