@@ -39,9 +39,15 @@ const CONFIG = {
   RATE_LIMIT_CLEANUP_MS: 5 * 60 * 1000,
 };
 
-/** 代理页面的基本 CSP 头，限制脚本来源，防止代理页面执行恶意脚本 */
+/** 代理页面的基本 CSP 头，限制脚本来源，防止代理页面执行恶意脚本。
+ *
+ * NOTE: 移除了 script-src 中的 'unsafe-inline'，防止代理页面通过内联
+ * 脚本实施 XSS 攻击。保留 default-src 中的 'unsafe-inline' 以兼容 CSS
+ * 内联样式（大多数代理页面的样式依赖此设置）。如果代理页面的脚本全部
+ * 通过外部 <script src> 加载，此修改不会影响功能。
+ */
 const PROXY_CSP = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
-  "script-src * 'unsafe-inline' 'unsafe-eval'; " +
+  "script-src * 'unsafe-eval'; " +
   "frame-ancestors 'self'";
 
 // 从 CONFIG 中导出常用引用，保持兼容
