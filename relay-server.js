@@ -204,7 +204,10 @@ const server = http.createServer(async (req, res) => {
           method: redirectMethod,
           headers: {
             'Content-Type': req.headers['content-type'] || 'application/octet-stream',
-            'X-Original-Method': originalMethod,
+            // 透传本次重定向应使用的方法（301/302/303 时为 GET，307/308 时保持
+            // 原始方法）。否则内部重入 /fetch 会按 X-Original-Method 继续以原始
+            // POST 请求重定向目标，违反 302/303 应转为 GET 的 HTTP 语义。
+            'X-Original-Method': redirectMethod,
           },
         }, (redirectRes) => {
           const respHeaders = { ...redirectRes.headers, ...corsHeaders };
