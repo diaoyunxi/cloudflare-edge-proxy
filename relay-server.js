@@ -86,6 +86,11 @@ const server = http.createServer(async (req, res) => {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Original-URL, X-Relay-Token, X-Original-Method',
+    // 安全响应头 — 防止 MIME 嗅探、点击劫持、referrer 泄露
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   };
 
   // 处理 OPTIONS 预检
