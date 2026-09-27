@@ -20,6 +20,8 @@
 const http = require('http');
 const https = require('https');
 const url = require('url');
+const dns = require('dns').promises;
+const net = require('net');
 
 // ==================== 配置常量 ====================
 
@@ -28,6 +30,9 @@ const DEFAULT_PORT = 3000;
 
 /** 代理请求超时时间（毫秒） */
 const PROXY_TIMEOUT_MS = 15000;
+
+/** 最大请求体大小（10 MB），防止 DoS（CWE-770） */
+const MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
 
 /** 最大重定向次数 */
 const MAX_REDIRECTS = 5;
@@ -83,6 +88,11 @@ const server = http.createServer(async (req, res) => {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Original-URL, X-Relay-Token, X-Original-Method',
+    // 安全响应头 — 防止 MIME 嗅探、点击劫持、referrer 泄露
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   };
 
   // 处理 OPTIONS 预检
@@ -134,6 +144,56 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // SSRF 防护：禁止访问内网/私有 IP 地址 (CWE-918)
+    const blockedHosts = [
+      'localhost', '127.0.0.1', '::1', '0.0.0.0',
+      '169.254.169.254', // AWS/GCP/Azure metadata service
+      'metadata.google.internal',
+      'metadata.internal',
+    ];
+    if (blockedHosts.includes(target.hostname)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+      res.end('Access to internal addresses is forbidden');
+      return;
+    }
+    // DNS 解析后校验：防止通过域名指向内网 IP 绕过
+    try {
+      const addrs = await dns.lookup(target.hostname, { all: true });
+      const isPrivate = addrs.some(({ address }) => {
+        if (net.isIPv4(address)) {
+          const parts = address.split('.').map(Number);
+          // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16
+          return (
+            parts[0] === 10 ||
+            (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+            (parts[0] === 192 && parts[1] === 168) ||
+            parts[0] === 127 ||
+            (parts[0] === 169 && parts[1] === 254) ||
+            parts[0] === 0
+          );
+        }
+        // IPv6: block loopback, link-local, unique-local
+        if (net.isIPv6(address)) {
+          return (
+            address === '::1' ||
+            address.startsWith('fe80') ||
+            address.startsWith('fc') ||
+            address.startsWith('fd')
+          );
+        }
+        return false;
+      });
+      if (isPrivate) {
+        res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+        res.end('Access to private network addresses is forbidden');
+        return;
+      }
+    } catch (dnsErr) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+      res.end('DNS resolution failed');
+      return;
+    }
+
     // 透传原始请求方法（由 Worker 通过 X-Original-Method 头传递）
     const originalMethod = req.headers['x-original-method'] || 'GET';
     const needsBody = !['GET', 'HEAD'].includes(originalMethod);
@@ -152,14 +212,30 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 缓冲请求体（需要 body 的方法先收集完整 body，防止重定向时流已消耗）
+    // 安全修复：添加请求体大小限制，防止 DoS（CWE-770）
     let bodyBuffer = Buffer.alloc(0);
     if (needsBody) {
-      bodyBuffer = await new Promise((resolve) => {
+      const bodyResult = await new Promise((resolve) => {
         const chunks = [];
-        req.on('data', (chunk) => chunks.push(chunk));
-        req.on('end', () => resolve(Buffer.concat(chunks)));
-        req.on('error', () => resolve(Buffer.alloc(0)));
+        let totalSize = 0;
+        req.on('data', (chunk) => {
+          totalSize += chunk.length;
+          if (totalSize > MAX_REQUEST_BODY_BYTES) {
+            req.destroy();
+            resolve({ error: true });
+            return;
+          }
+          chunks.push(chunk);
+        });
+        req.on('end', () => resolve({ data: Buffer.concat(chunks) }));
+        req.on('error', () => resolve({ data: Buffer.alloc(0) }));
       });
+      if (bodyResult.error) {
+        res.writeHead(413, { 'Content-Type': 'text/plain', ...corsHeaders });
+        res.end(`Request body too large (max ${MAX_REQUEST_BODY_BYTES / 1024 / 1024} MB)`);
+        return;
+      }
+      bodyBuffer = bodyResult.data;
     }
 
     const lib = target.protocol === 'https:' ? https : http;
@@ -204,7 +280,10 @@ const server = http.createServer(async (req, res) => {
           method: redirectMethod,
           headers: {
             'Content-Type': req.headers['content-type'] || 'application/octet-stream',
-            'X-Original-Method': originalMethod,
+            // 透传本次重定向应使用的方法（301/302/303 时为 GET，307/308 时保持
+            // 原始方法）。否则内部重入 /fetch 会按 X-Original-Method 继续以原始
+            // POST 请求重定向目标，违反 302/303 应转为 GET 的 HTTP 语义。
+            'X-Original-Method': redirectMethod,
           },
         }, (redirectRes) => {
           const respHeaders = { ...redirectRes.headers, ...corsHeaders };
