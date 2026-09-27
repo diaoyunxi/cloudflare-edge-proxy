@@ -20,6 +20,8 @@
 const http = require('http');
 const https = require('https');
 const url = require('url');
+const dns = require('dns').promises;
+const net = require('net');
 
 // ==================== 配置常量 ====================
 
@@ -139,6 +141,56 @@ const server = http.createServer(async (req, res) => {
     if (!['http:', 'https:'].includes(target.protocol)) {
       res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
       res.end('Unsupported protocol');
+      return;
+    }
+
+    // SSRF 防护：禁止访问内网/私有 IP 地址 (CWE-918)
+    const blockedHosts = [
+      'localhost', '127.0.0.1', '::1', '0.0.0.0',
+      '169.254.169.254', // AWS/GCP/Azure metadata service
+      'metadata.google.internal',
+      'metadata.internal',
+    ];
+    if (blockedHosts.includes(target.hostname)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+      res.end('Access to internal addresses is forbidden');
+      return;
+    }
+    // DNS 解析后校验：防止通过域名指向内网 IP 绕过
+    try {
+      const addrs = await dns.lookup(target.hostname, { all: true });
+      const isPrivate = addrs.some(({ address }) => {
+        if (net.isIPv4(address)) {
+          const parts = address.split('.').map(Number);
+          // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16
+          return (
+            parts[0] === 10 ||
+            (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+            (parts[0] === 192 && parts[1] === 168) ||
+            parts[0] === 127 ||
+            (parts[0] === 169 && parts[1] === 254) ||
+            parts[0] === 0
+          );
+        }
+        // IPv6: block loopback, link-local, unique-local
+        if (net.isIPv6(address)) {
+          return (
+            address === '::1' ||
+            address.startsWith('fe80') ||
+            address.startsWith('fc') ||
+            address.startsWith('fd')
+          );
+        }
+        return false;
+      });
+      if (isPrivate) {
+        res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+        res.end('Access to private network addresses is forbidden');
+        return;
+      }
+    } catch (dnsErr) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
+      res.end('DNS resolution failed');
       return;
     }
 
