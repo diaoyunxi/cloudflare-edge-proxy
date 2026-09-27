@@ -1167,11 +1167,14 @@ function checkProxyAuth(request, env) {
   const queryKey = url.searchParams.get('key');
   const providedKey = headerKey || queryKey;
   if (!providedKey) return false;
-  // 常量时间比较，防止时序攻击
-  if (providedKey.length !== apiKey.length) return false;
-  let diff = 0;
-  for (let i = 0; i < apiKey.length; i++) {
-    diff |= providedKey.charCodeAt(i) ^ apiKey.charCodeAt(i);
+  // 真正的常量时间比较，防止时序攻击
+  // 先比较长度差异（不提前返回），再逐字节比较，避免长度不同时的短路泄露
+  const len = Math.max(providedKey.length, apiKey.length);
+  let diff = providedKey.length ^ apiKey.length;
+  for (let i = 0; i < len; i++) {
+    const a = i < providedKey.length ? providedKey.charCodeAt(i) : 0;
+    const b = i < apiKey.length ? apiKey.charCodeAt(i) : 0;
+    diff |= a ^ b;
   }
   return diff === 0;
 }
