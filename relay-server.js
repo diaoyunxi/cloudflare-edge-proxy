@@ -29,6 +29,9 @@ const DEFAULT_PORT = 3000;
 /** 代理请求超时时间（毫秒） */
 const PROXY_TIMEOUT_MS = 15000;
 
+/** 最大请求体大小（10 MB），防止 DoS（CWE-770） */
+const MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
+
 /** 最大重定向次数 */
 const MAX_REDIRECTS = 5;
 
@@ -152,14 +155,30 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 缓冲请求体（需要 body 的方法先收集完整 body，防止重定向时流已消耗）
+    // 安全修复：添加请求体大小限制，防止 DoS（CWE-770）
     let bodyBuffer = Buffer.alloc(0);
     if (needsBody) {
-      bodyBuffer = await new Promise((resolve) => {
+      const bodyResult = await new Promise((resolve) => {
         const chunks = [];
-        req.on('data', (chunk) => chunks.push(chunk));
-        req.on('end', () => resolve(Buffer.concat(chunks)));
-        req.on('error', () => resolve(Buffer.alloc(0)));
+        let totalSize = 0;
+        req.on('data', (chunk) => {
+          totalSize += chunk.length;
+          if (totalSize > MAX_REQUEST_BODY_BYTES) {
+            req.destroy();
+            resolve({ error: true });
+            return;
+          }
+          chunks.push(chunk);
+        });
+        req.on('end', () => resolve({ data: Buffer.concat(chunks) }));
+        req.on('error', () => resolve({ data: Buffer.alloc(0) }));
       });
+      if (bodyResult.error) {
+        res.writeHead(413, { 'Content-Type': 'text/plain', ...corsHeaders });
+        res.end(`Request body too large (max ${MAX_REQUEST_BODY_BYTES / 1024 / 1024} MB)`);
+        return;
+      }
+      bodyBuffer = bodyResult.data;
     }
 
     const lib = target.protocol === 'https:' ? https : http;
