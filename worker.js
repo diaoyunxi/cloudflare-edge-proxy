@@ -1333,3 +1333,10 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 };
+// =====================================================================
+// Error Handling Best Practices
+// =====================================================================
+// - Always catch and log errors in async handlers
+// - Return user-friendly error pages for 5xx errors
+// - Use structured logging for debugging (include request ID, timestamp)
+// - Implement circuit breaker pattern for upstream failures
