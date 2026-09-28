@@ -48,7 +48,7 @@ const CONFIG = {
  * 如需为特定网站启用 eval，请在 CSP 中添加 'unsafe-eval' 并限制 script-src 到可信域名
  */
 const PROXY_CSP = "default-src * 'unsafe-inline' data: blob:; " +
-  "script-src *; " +
+  "script-src 'self' 'unsafe-inline'; " +
   "frame-ancestors 'self'";
 
 // 从 CONFIG 中导出常用引用，保持兼容
@@ -1333,3 +1333,10 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 };
+// =====================================================================
+// Error Handling Best Practices
+// =====================================================================
+// - Always catch and log errors in async handlers
+// - Return user-friendly error pages for 5xx errors
+// - Use structured logging for debugging (include request ID, timestamp)
+// - Implement circuit breaker pattern for upstream failures
