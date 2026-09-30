@@ -157,6 +157,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     // DNS 解析后校验：防止通过域名指向内网 IP 绕过
+    // 修复 TOCTOU (CWE-367)：保存首次解析的 IP，后续请求直接使用该 IP，
+    // 防止攻击者通过 DNS rebinding 在检查与请求之间切换解析结果绕过 SSRF 防护。
+    let resolvedIp = null;
+    let resolvedFamily = 4;
     try {
       const addrs = await dns.lookup(target.hostname, { all: true });
       const isPrivate = addrs.some(({ address }) => {
@@ -172,13 +176,14 @@ const server = http.createServer(async (req, res) => {
             parts[0] === 0
           );
         }
-        // IPv6: block loopback, link-local, unique-local
+        // IPv6: block loopback, link-local, unique-local, multicast
         if (net.isIPv6(address)) {
           return (
             address === '::1' ||
             address.startsWith('fe80') ||
             address.startsWith('fc') ||
-            address.startsWith('fd')
+            address.startsWith('fd') ||
+            address.startsWith('ff')
           );
         }
         return false;
@@ -187,6 +192,11 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
         res.end('Access to private network addresses is forbidden');
         return;
+      }
+      // 保存首个解析到的安全 IP，用于后续请求（防止 DNS rebinding TOCTOU）
+      if (addrs.length > 0) {
+        resolvedIp = addrs[0].address;
+        resolvedFamily = addrs[0].family || (net.isIPv6(addrs[0].address) ? 6 : 4);
       }
     } catch (dnsErr) {
       res.writeHead(403, { 'Content-Type': 'text/plain', ...corsHeaders });
@@ -240,12 +250,16 @@ const server = http.createServer(async (req, res) => {
 
     const lib = target.protocol === 'https:' ? https : http;
 
+    // 使用已解析的 IP 地址直接连接，防止第二次 DNS 查询被 DNS rebinding 利用 (CWE-367)
     const options = {
-      hostname: target.hostname,
+      hostname: resolvedIp || target.hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
       path: target.pathname + target.search,
       method: originalMethod,
       headers: headers,
+      family: resolvedFamily,
+      // TLS: 仍然按原始 hostname 校验证书（而非 IP），保证 HTTPS 证书链验证正确
+      servername: target.hostname,
     };
 
     const proxyReq = lib.request(options, (proxyRes) => {
