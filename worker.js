@@ -897,15 +897,30 @@ async function proxyRequest(targetUrl, request, env) {
  * @returns {number}
  */
 function compareVersions(a, b) {
-  const parse = (v) => v.replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  // 拆成「数字段」与「预发布后缀」两部分，例如 v1.5.0-beta → { nums: [1,5,0], pre: 'beta' }
+  const parse = (v) => {
+    const s = String(v || '').trim().replace(/^v/i, '');
+    const dashIndex = s.indexOf('-');
+    const core = dashIndex === -1 ? s : s.slice(0, dashIndex);
+    const pre = dashIndex === -1 ? '' : s.slice(dashIndex + 1);
+    return { nums: core.split('.').map(n => parseInt(n, 10) || 0), pre };
+  };
   const pa = parse(a);
   const pb = parse(b);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const va = pa[i] || 0;
-    const vb = pb[i] || 0;
+  for (let i = 0; i < Math.max(pa.nums.length, pb.nums.length); i++) {
+    const va = pa.nums[i] || 0;
+    const vb = pb.nums[i] || 0;
     if (va > vb) return 1;
     if (va < vb) return -1;
   }
+  // 数字段完全相同时再比较预发布后缀。
+  // 按 SemVer 规则，带预发布后缀的版本低于同号正式版（1.5.0-beta < 1.5.0）。
+  // 旧实现用 parseInt 直接丢掉了后缀，使 v1.5.0-beta 与 v1.5.0 被判为「相同」，
+  // 自动更新逻辑因此永远不会把预发布版本升级到正式版。
+  if (pa.pre && !pb.pre) return -1;
+  if (!pa.pre && pb.pre) return 1;
+  if (pa.pre < pb.pre) return -1;
+  if (pa.pre > pb.pre) return 1;
   return 0;
 }
 
