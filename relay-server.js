@@ -84,8 +84,10 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
 
   // CORS 头（支持 GET/HEAD/OPTIONS，与实际代理能力一致）
+  // CORS: 允许通过 RELAY_ALLOWED_ORIGIN 环境变量限制来源，默认 * 仅适用于无凭据场景
+  const ALLOWED_ORIGIN = process.env.RELAY_ALLOWED_ORIGIN || '*';
   const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Original-URL, X-Relay-Token, X-Original-Method',
     // 安全响应头 — 防止 MIME 嗅探、点击劫持、referrer 泄露
