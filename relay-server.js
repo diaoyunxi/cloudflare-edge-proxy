@@ -129,6 +129,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // URL 长度限制：防止超长 URL 导致的 DoS (CWE-400)
+    if (targetUrl.length > 8192) {
+      res.writeHead(413, { 'Content-Type': 'text/plain', ...corsHeaders });
+      res.end('URL too long (max 8192 characters)');
+      return;
+    }
+
     let target;
     try {
       target = new URL(targetUrl);
