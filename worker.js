@@ -310,6 +310,7 @@ async function rewriteHtml(html, baseUrl) {
 
   // 创建临时 Response 供 HTMLRewriter 处理
   const tempResponse = new Response(html, {
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
     headers: { 'Content-Type': 'text/html; charset=utf-8' },
   });
   const transformed = rewriter.transform(tempResponse);
