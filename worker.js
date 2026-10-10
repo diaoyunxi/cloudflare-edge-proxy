@@ -43,12 +43,12 @@ const CONFIG = {
  *
  * 安全说明：
  * 'unsafe-eval' 已移除——大多数网站不需要 eval()，保留它会允许 XSS 攻击执行任意代码
- * script-src 中的 'unsafe-inline' 已移除，防止代理页面通过内联脚本实施 XSS 攻击；
+ * script-src 'self'中的 'unsafe-inline' 已移除，防止代理页面通过内联脚本实施 XSS 攻击；
  * 保留 default-src 中的 'unsafe-inline' 以兼容 CSS 内联样式（大多数代理页面的样式依赖此设置）
- * 如需为特定网站启用 eval，请在 CSP 中添加 'unsafe-eval' 并限制 script-src 到可信域名
+ * 如需为特定网站启用 eval，请在 CSP 中添加 'unsafe-eval' 并限制 script-src 'self'到可信域名
  */
 const PROXY_CSP = "default-src * 'unsafe-inline' data: blob:; " +
-  "script-src *; " +
+  "script-src 'self'*; " +
   "frame-ancestors 'self'";
 
 // 从 CONFIG 中导出常用引用，保持兼容
