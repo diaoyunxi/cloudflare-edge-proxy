@@ -275,7 +275,10 @@ const server = http.createServer(async (req, res) => {
       // 如果是重定向，跟随重定向
       if (REDIRECT_STATUS_CODES.includes(proxyRes.statusCode) && proxyRes.headers.location) {
         const redirectUrl = new URL(proxyRes.headers.location, targetUrl).href;
-        const redirectCount = parseInt(parsedUrl.query._redirect || '0');
+        // 校验 _redirect 为非负整数；parseInt 对非数字串返回 NaN，
+        // NaN >= MAX_REDIRECTS 恒为 false，会导致重定向循环永不终止（DoS）。
+        let redirectCount = parseInt(parsedUrl.query._redirect, 10);
+        if (!Number.isFinite(redirectCount) || redirectCount < 0) redirectCount = 0;
 
         if (redirectCount >= MAX_REDIRECTS) {
           // 【严重缺陷 3.6 修复】超过最大重定向次数，终止循环并返回 508
@@ -312,7 +315,8 @@ const server = http.createServer(async (req, res) => {
           const respHeaders = { ...redirectRes.headers, ...corsHeaders };
           delete respHeaders['content-length'];
           delete respHeaders['transfer-encoding'];
-          delete respHeaders['content-encoding'];
+          // 保留 content-encoding：中继不做解压，直接透传上游压缩字节，
+          // 浏览器按 Content-Encoding 自行解压。删掉会导致 gzip/br 响应显示为乱码。
           res.writeHead(redirectRes.statusCode, respHeaders);
           redirectRes.pipe(res);
         });
@@ -332,7 +336,8 @@ const server = http.createServer(async (req, res) => {
       const respHeaders = { ...proxyRes.headers, ...corsHeaders };
       delete respHeaders['content-length'];
       delete respHeaders['transfer-encoding'];
-      delete respHeaders['content-encoding'];
+      // 保留 content-encoding：中继不做解压，直接透传上游压缩字节，
+      // 浏览器按 Content-Encoding 自行解压。删掉会导致 gzip/br 响应显示为乱码。
 
       res.writeHead(proxyRes.statusCode, respHeaders);
       proxyRes.pipe(res);
