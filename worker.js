@@ -508,6 +508,32 @@ function getInjectedScript(baseUrl) {
 </script>`;
 }
 
+// ==================== CORS 跨域支持 ====================
+
+/**
+ * 浏览器跨域访问本 Worker 时使用的许可头。
+ * 本项目不转发 Cookie、不使用凭据模式，因此允许任意来源；
+ * 如需限制来源，改为按 Origin 白名单回显，并追加 Vary: Origin。
+ */
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers':
+    'Content-Type, X-Proxy-Key, X-Original-URL, X-Original-Method, X-Relay-Token',
+  'Access-Control-Max-Age': '86400',
+};
+
+/** 为任意响应附加 CORS 许可头（错误响应同样需要，否则浏览器只报 CORS error） */
+function withCors(response) {
+  // 101/204/205/304 等状态码不允许携带响应体
+  const body = [101, 204, 205, 304].includes(response.status) ? null : response.body;
+  const res = new Response(body, response);
+  for (const [key, value] of Object.entries(CORS_HEADERS)) {
+    res.headers.set(key, value);
+  }
+  return res;
+}
+
 // ==================== 响应头处理 ====================
 
 function cleanHeaders(headers) {
@@ -1236,7 +1262,7 @@ function checkRateLimit(request, env) {
 
 // ==================== 主入口 ====================
 
-export default {
+const handler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
@@ -1350,6 +1376,18 @@ export default {
 
     // 404
     return new Response('Not Found', { status: 404 });
+  },
+};
+
+// ==================== 对外入口（含 CORS 预检短路） ====================
+
+export default {
+  async fetch(request, env, ctx) {
+    // 预检必须早于鉴权、限流与代理转发，否则会被 401/429 掐断
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+    return withCors(await handler.fetch(request, env, ctx));
   },
 };
 // =====================================================================

@@ -83,12 +83,12 @@ function shouldPreserveMethod(statusCode) {
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
 
-  // CORS 头（支持 GET/HEAD/OPTIONS，与实际代理能力一致）
+  // CORS 头（/fetch 通过 X-Original-Method 透传任意方法）
   // CORS: 允许通过 RELAY_ALLOWED_ORIGIN 环境变量限制来源，默认 * 仅适用于无凭据场景
   const ALLOWED_ORIGIN = process.env.RELAY_ALLOWED_ORIGIN || '*';
   const corsHeaders = {
     'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Original-URL, X-Relay-Token, X-Original-Method',
     // 安全响应头 — 防止 MIME 嗅探、点击劫持、referrer 泄露
     'X-Content-Type-Options': 'nosniff',
@@ -97,9 +97,13 @@ const server = http.createServer(async (req, res) => {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   };
 
-  // 处理 OPTIONS 预检
+  // 处理 OPTIONS 预检（必须早于鉴权与路由）
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, corsHeaders);
+    res.writeHead(204, {
+      ...corsHeaders,
+      'Access-Control-Max-Age': '86400',
+      'Vary': 'Origin',
+    });
     res.end();
     return;
   }
