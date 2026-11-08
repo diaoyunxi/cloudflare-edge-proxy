@@ -1,3 +1,5 @@
+> [← 返回文档目录](../README.md) ｜ 原文件：`SECURITY.md`。
+
 # Security Policy
 
 ## Reporting a Vulnerability
